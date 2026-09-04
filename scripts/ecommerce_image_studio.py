@@ -12,15 +12,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
-MAX_REFERENCE_IMAGES = 3
+MAX_REFERENCE_IMAGES = 16
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_PROMPT_CHARS = 5000
 MAX_RESPONSE_BYTES = 5_000_000
@@ -63,6 +63,36 @@ TYPE_INSTRUCTIONS = {
         "Do not print measurements unless exact verified dimensions were supplied. Keep perspective physically plausible."
     ),
 }
+REFERENCE_ROLE_ALIASES = {
+    "front": "front",
+    "正面": "front",
+    "back": "back",
+    "背面": "back",
+    "left": "left",
+    "左侧": "left",
+    "right": "right",
+    "右侧": "right",
+    "side": "side",
+    "侧面": "side",
+    "top": "top",
+    "顶部": "top",
+    "bottom": "bottom",
+    "底部": "bottom",
+    "detail": "detail",
+    "细节": "detail",
+    "packaging": "packaging",
+    "包装": "packaging",
+    "label": "label",
+    "标签": "label",
+    "scale": "scale",
+    "尺寸参照": "scale",
+}
+REFERENCE_ROLE_ORDER = tuple(dict.fromkeys(REFERENCE_ROLE_ALIASES.values()))
+FRONT_FACING_TYPES = {"white_bg", "hero", "lifestyle", "feature", "size_reference"}
+APPAREL_KEYWORDS = (
+    "服装", "服饰", "女装", "男装", "童装", "内衣", "衣", "裤", "裙", "上装", "下装", "外套", "t恤", "衬衫",
+    "garment", "apparel", "clothing", "dress", "shirt", "jacket", "coat", "trousers",
+)
 
 
 class StudioError(RuntimeError):
@@ -128,6 +158,42 @@ def validate_reference_url(value: str) -> str:
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise StudioError("Reference images for direct API use must be public HTTPS URLs without credentials")
     return value.strip()
+
+
+def normalize_reference_role(value: str) -> str:
+    role = REFERENCE_ROLE_ALIASES.get(value.strip().lower()) or REFERENCE_ROLE_ALIASES.get(value.strip())
+    if not role:
+        raise StudioError(
+            "Reference role must be one of: %s" % ", ".join(REFERENCE_ROLE_ORDER)
+        )
+    return role
+
+
+def parse_reference_input(value: Any, location_key: str) -> Tuple[str, str]:
+    if isinstance(value, dict):
+        role_value = value.get("role")
+        location = value.get(location_key)
+        if not isinstance(role_value, str) or not isinstance(location, str):
+            raise StudioError("Reference objects require role and %s string fields" % location_key)
+        return normalize_reference_role(role_value), location.strip()
+    role_value, separator, location = str(value).partition("=")
+    if not separator or not location.strip():
+        raise StudioError(
+            "Every reference image must declare its view as ROLE=VALUE, for example front=product-front.jpg"
+        )
+    return normalize_reference_role(role_value), location.strip()
+
+
+def required_reference_roles(category: str, image_types: Sequence[str], requested: Sequence[str]) -> List[str]:
+    required = {normalize_reference_role(str(value)) for value in requested}
+    if FRONT_FACING_TYPES.intersection(image_types):
+        required.add("front")
+    if "detail" in image_types:
+        required.add("detail")
+    lowered_category = category.lower()
+    if FRONT_FACING_TYPES.intersection(image_types) and any(keyword in lowered_category for keyword in APPAREL_KEYWORDS):
+        required.add("back")
+    return [role for role in REFERENCE_ROLE_ORDER if role in required]
 
 
 def detect_reference_mime(path: Path, header: bytes) -> str:
@@ -278,6 +344,7 @@ def build_prompt(
     visible_copy: List[str],
     audience: str,
     scene: str,
+    reference_roles: Sequence[str],
     has_references: bool,
 ) -> str:
     selling_points = product.get("selling_points") or []
@@ -296,6 +363,12 @@ def build_prompt(
         prompt.append("Target audience: %s. Keep casting, styling, props, and visual hierarchy appropriate for them." % audience)
     if scene and image_type in {"hero", "lifestyle"}:
         prompt.append("Requested use scene: %s. Keep it realistic for the product and audience." % scene)
+    if reference_roles:
+        ordered_roles = ", ".join("image %d=%s" % (index, role) for index, role in enumerate(reference_roles, 1))
+        prompt.append(
+            "Reference order and evidence roles: %s. Use each reference only as evidence for its labeled view. "
+            "Never invent an unseen product face, construction, closure, print, seam, label, logo, or accessory." % ordered_roles
+        )
     if text_mode == "render" and visible_copy:
         prompt.append(
             "Render clear, correctly spelled visible copy in %s. Use each of these verified phrases once: %s. "
@@ -342,7 +415,13 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     raw_references = args.reference_url if args.reference_url is not None else brief.get("reference_urls", [])
     if not isinstance(raw_references, list):
         raise StudioError("reference_urls in the product brief must be an array")
-    references = [validate_reference_url(str(value)) for value in raw_references]
+    references = []
+    reference_views = []
+    for value in raw_references:
+        role, url_value = parse_reference_input(value, "url")
+        url = validate_reference_url(url_value)
+        references.append(url)
+        reference_views.append({"kind": "url", "role": role, "url": url})
     raw_reference_files = (
         getattr(args, "reference_file", None)
         if getattr(args, "reference_file", None) is not None
@@ -351,7 +430,13 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     if not isinstance(raw_reference_files, list):
         raise StudioError("reference_files in the product brief must be an array")
     file_base = brief_path.parent if brief_path and getattr(args, "reference_file", None) is None else None
-    reference_files = [describe_reference_file(str(value), file_base) for value in raw_reference_files]
+    reference_files = []
+    for value in raw_reference_files:
+        role, path_value = parse_reference_input(value, "path")
+        descriptor = describe_reference_file(path_value, file_base)
+        descriptor["role"] = role
+        reference_files.append(descriptor)
+        reference_views.append({"kind": "file", "role": role, "path": descriptor["path"]})
     if len(references) + len(reference_files) > MAX_REFERENCE_IMAGES:
         raise StudioError("Qx-Image accepts at most %d reference images" % MAX_REFERENCE_IMAGES)
     raw_selling_points = args.selling_point if args.selling_point is not None else brief.get("selling_points", [])
@@ -366,12 +451,24 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     }
     if not product["name"] or not product["category"]:
         raise StudioError("Product name and category are required")
-    if not (references or reference_files or product["description"]):
-        raise StudioError("Provide at least one reference image or a verified product description")
+    if not reference_views:
+        raise StudioError("At least one role-labeled product reference image is required for fidelity")
     raw_types = getattr(args, "types", None) or brief.get("types")
     if not raw_types:
         raise StudioError("Choose the image types before creating a plan")
     image_types = parse_types(str(raw_types))
+    raw_required_views = getattr(args, "required_view", None)
+    if raw_required_views is None:
+        raw_required_views = brief.get("required_views", [])
+    if not isinstance(raw_required_views, list):
+        raise StudioError("required_views in the product brief must be an array")
+    required_roles = required_reference_roles(product["category"], image_types, raw_required_views)
+    supplied_roles = {view["role"] for view in reference_views}
+    missing_roles = [role for role in required_roles if role not in supplied_roles]
+    if missing_roles:
+        raise StudioError(
+            "Reference coverage is insufficient for the requested images; ask the user for: %s" % ", ".join(missing_roles)
+        )
     if not 1 <= args.points_per_image <= 10000:
         raise StudioError("Points per image estimate must be between 1 and 10000")
     raw_size = args.size or brief.get("size")
@@ -425,6 +522,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
                         visible_copy,
                         audience,
                         scene,
+                        [view["role"] for view in reference_views],
                         bool(references or reference_files),
                     ),
                     "size": size,
@@ -434,7 +532,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generator_version": VERSION,
         "created_at": now_iso(),
         "provider": "算点边界",
@@ -448,6 +546,13 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "product": product,
         "reference_images": references,
         "reference_files": reference_files,
+        "reference_views": reference_views,
+        "reference_coverage": {
+            "supplied_roles": [role for role in REFERENCE_ROLE_ORDER if role in supplied_roles],
+            "required_roles": required_roles,
+            "missing_roles": [],
+            "status": "complete",
+        },
         "points_per_image_estimate": args.points_per_image,
         "estimated_points": args.points_per_image * len(jobs),
         "jobs": jobs,
@@ -467,6 +572,8 @@ def command_plan(args: argparse.Namespace) -> None:
                 "images": len(plan["jobs"]),
                 "estimated_points": plan["estimated_points"],
                 "reference_images": len(plan["reference_images"]) + len(plan.get("reference_files") or []),
+                "reference_roles": plan["reference_coverage"]["supplied_roles"],
+                "fidelity_gate": plan["reference_coverage"]["status"],
             },
             ensure_ascii=False,
         )
@@ -577,6 +684,40 @@ def extract_upload_url(response: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def extract_upload_expiry_seconds(response: Dict[str, Any]) -> int:
+    candidates = [response.get("expires_in")]
+    data = response.get("data")
+    if isinstance(data, dict):
+        candidates.append(data.get("expires_in"))
+    for value in candidates:
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return seconds
+    return 24 * 60 * 60
+
+
+def upload_url_expired(row: Dict[str, Any]) -> bool:
+    expiry_value = row.get("expires_at")
+    if not expiry_value and row.get("uploaded_at"):
+        try:
+            uploaded_at = datetime.fromisoformat(str(row["uploaded_at"]))
+            expiry_value = (uploaded_at + timedelta(hours=24)).isoformat()
+        except ValueError:
+            return True
+    if not expiry_value:
+        return True
+    try:
+        expiry = datetime.fromisoformat(str(expiry_value))
+    except ValueError:
+        return True
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry <= datetime.now(timezone.utc)
+
+
 def nested_values(value: Any, keys: Iterable[str]) -> Iterable[Any]:
     key_set = set(keys)
     if isinstance(value, dict):
@@ -660,7 +801,7 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generator_version": VERSION,
         "plan": str(plan_path),
         "plan_sha256": plan_fingerprint(plan),
@@ -673,6 +814,8 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
                 "status": "not_uploaded",
                 "url": None,
                 "uploaded_at": None,
+                "expires_in": None,
+                "expires_at": None,
                 "updated_at": None,
             }
             for descriptor in (plan.get("reference_files") or [])
@@ -703,6 +846,8 @@ def upload_local_references(
                 "status": "not_uploaded",
                 "url": None,
                 "uploaded_at": None,
+                "expires_in": None,
+                "expires_at": None,
                 "updated_at": None,
             }
             for descriptor in (plan.get("reference_files") or [])
@@ -716,11 +861,18 @@ def upload_local_references(
     for row in uploads:
         status = row.get("status")
         if status == "uploaded":
-            url = extract_upload_url({"url": row.get("url")})
-            if not url:
-                raise StudioError("Manifest contains an invalid uploaded reference URL")
-            uploaded_urls.append(url)
-            continue
+            if upload_url_expired(row):
+                row["status"] = "not_uploaded"
+                row["url"] = None
+                row["updated_at"] = now_iso()
+                status = "not_uploaded"
+                write_json_atomic(manifest_path, manifest)
+            else:
+                url = extract_upload_url({"url": row.get("url")})
+                if not url:
+                    raise StudioError("Manifest contains an invalid uploaded reference URL")
+                uploaded_urls.append(url)
+                continue
         if status in {"uploading", "upload_unknown"}:
             raise StudioError(
                 "A previous reference upload has an unknown outcome. Check uploaded files before creating a new plan "
@@ -751,7 +903,11 @@ def upload_local_references(
             raise StudioError("Reference upload returned no HTTPS URL; response was saved for inspection")
         row["status"] = "uploaded"
         row["url"] = url
-        row["uploaded_at"] = now_iso()
+        uploaded_at = datetime.now(timezone.utc).replace(microsecond=0)
+        expires_in = extract_upload_expiry_seconds(response)
+        row["uploaded_at"] = uploaded_at.isoformat()
+        row["expires_in"] = expires_in
+        row["expires_at"] = (uploaded_at + timedelta(seconds=expires_in)).isoformat()
         row["updated_at"] = row["uploaded_at"]
         row.pop("error", None)
         manifest["reference_images"] = direct_urls + uploaded_urls + [url]
@@ -782,12 +938,16 @@ def command_generate(args: argparse.Namespace) -> None:
         "images": len(jobs),
         "local_reference_uploads": len(plan.get("reference_files") or []),
         "remote_reference_urls": len(plan.get("reference_images") or []),
+        "reference_roles": (plan.get("reference_coverage") or {}).get("supplied_roles", []),
+        "fidelity_gate": (plan.get("reference_coverage") or {}).get("status", "unknown"),
         "estimated_points": estimate,
         "manifest": str(manifest_path),
     }
     if not args.execute:
         print(json.dumps(preview, ensure_ascii=False, indent=2))
         return
+    if preview["fidelity_gate"] != "complete":
+        raise StudioError("Live generation requires a complete role-labeled reference coverage check; recreate the plan")
     if not args.confirm_live_run:
         raise StudioError("Live generation requires --confirm-live-run after reviewing the endpoint and estimated points")
     if args.max_points is None or args.max_points < estimate:
@@ -797,7 +957,14 @@ def command_generate(args: argparse.Namespace) -> None:
     manifest = load_or_create_manifest(manifest_path, plan, plan_path)
     manifest_rows = {row["job_id"]: row for row in manifest["jobs"]}
     endpoint = api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true")
-    reference_urls = upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
+    has_pending_jobs = any(
+        not row.get("task_id") and row.get("status") == "not_submitted" for row in manifest["jobs"]
+    )
+    reference_urls = (
+        upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
+        if has_pending_jobs
+        else [validate_reference_url(str(value)) for value in (manifest.get("reference_images") or [])]
+    )
     submitted = 0
     for job in jobs:
         row = manifest_rows.get(job["job_id"])
@@ -1003,6 +1170,7 @@ def command_audit(args: argparse.Namespace) -> None:
         "schema_version": 1,
         "audited_at": now_iso(),
         "language": plan.get("language") or "简体中文",
+        "reference_coverage": plan.get("reference_coverage") or {},
         "files": rows,
         "automatic_checks_passed": bool(rows) and all(
             not row.get("error")
@@ -1012,7 +1180,8 @@ def command_audit(args: argparse.Namespace) -> None:
             for row in rows
         ),
         "manual_review": [
-            "商品轮廓、比例、颜色、材质、Logo、标签和包装与原图一致",
+            "将每张成图与对应角色参考图并排核对：轮廓、正背面结构、比例、颜色、材质和图案一致",
+            "Logo、标签、包装文字、接缝、纽扣、拉链、接口、配件及其位置与参考图一致",
             "未生成不存在的配件、功能、认证、价格、功效或促销承诺",
             "逐字核对 expected_copy：目标语言正确、无错字漏字、无额外文案，尺寸与单位来自已核实数据",
             "场景中的使用方式、人物接触关系和产品尺度真实合理",
@@ -1039,6 +1208,8 @@ def command_doctor(args: argparse.Namespace) -> None:
         "ready_for_plan": True,
         "ready_for_generate": key_name_ok and bool(os.environ.get(args.api_key_env, "").strip()),
         "ready_for_audit": pillow,
+        "max_reference_images": MAX_REFERENCE_IMAGES,
+        "reference_roles": list(REFERENCE_ROLE_ORDER),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
@@ -1065,8 +1236,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--description")
     plan.add_argument("--selling-point", action="append")
     plan.add_argument("--dimensions")
-    plan.add_argument("--reference-url", action="append")
-    plan.add_argument("--reference-file", action="append")
+    plan.add_argument("--reference-url", action="append", help="Role-labeled reference as ROLE=HTTPS_URL")
+    plan.add_argument("--reference-file", action="append", help="Role-labeled reference as ROLE=PATH")
+    plan.add_argument("--required-view", action="append", help="Additional product view that must be covered")
     plan.add_argument("--platform")
     plan.add_argument("--tone")
     plan.add_argument("--language", help="Required visible copy language, such as 简体中文 or English")

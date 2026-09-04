@@ -17,9 +17,20 @@
   "size": "1:1",
   "quality": "medium",
   "reference_urls": [
-    "https://example.com/product-front.jpg"
+    {
+      "role": "front",
+      "url": "https://example.com/product-front.jpg"
+    },
+    {
+      "role": "detail",
+      "url": "https://example.com/product-detail.jpg"
+    }
   ],
   "reference_files": [],
+  "required_views": [
+    "front",
+    "detail"
+  ],
   "copy_by_type": {
     "hero": [
       "轻盈随行",

@@ -23,7 +23,7 @@ def plan_args(**overrides):
         "description": "磨砂黑杯身，不锈钢内胆，黑色旋盖",
         "selling_point": ["保温锁温", "单手开合"],
         "dimensions": "350 mL",
-        "reference_url": ["https://assets.example.com/cup.jpg"],
+        "reference_url": ["front=https://assets.example.com/cup.jpg"],
         "reference_file": None,
         "platform": "京东",
         "tone": "clean and premium",
@@ -65,7 +65,15 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Do not add any other", prompt)
 
     def test_render_mode_assigns_copy_by_image_type(self):
-        plan = studio.create_plan(plan_args(types="white_bg,hero,lifestyle,feature,detail,size_reference"))
+        plan = studio.create_plan(
+            plan_args(
+                types="white_bg,hero,lifestyle,feature,detail,size_reference",
+                reference_url=[
+                    "front=https://assets.example.com/cup-front.jpg",
+                    "detail=https://assets.example.com/cup-detail.jpg",
+                ],
+            )
+        )
         copy_by_type = {job["type"]: job["copy"] for job in plan["jobs"]}
         self.assertEqual([], copy_by_type["white_bg"])
         self.assertEqual(["便携咖啡杯", "保温锁温", "单手开合"], copy_by_type["hero"])
@@ -113,8 +121,8 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Target audience: 城市通勤人群", prompt)
         self.assertIn("Requested use scene: 早晨地铁通勤", prompt)
 
-    def test_rejects_more_than_three_references(self):
-        references = ["https://example.com/%d.jpg" % index for index in range(4)]
+    def test_rejects_more_than_sixteen_references(self):
+        references = ["front=https://example.com/%d.jpg" % index for index in range(17)]
         with self.assertRaises(studio.StudioError):
             studio.create_plan(plan_args(reference_url=references))
 
@@ -122,11 +130,49 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(studio.StudioError):
             studio.validate_reference_url("http://example.com/product.jpg")
 
+    def test_apparel_front_generation_requires_front_and_back_evidence(self):
+        with self.assertRaises(studio.StudioError) as caught:
+            studio.create_plan(
+                plan_args(
+                    category="服装",
+                    types="hero",
+                    reference_url=["back=https://example.com/dress-back.jpg"],
+                )
+            )
+        self.assertIn("front", str(caught.exception))
+        plan = studio.create_plan(
+            plan_args(
+                category="服装",
+                types="hero",
+                reference_url=[
+                    "front=https://example.com/dress-front.jpg",
+                    "back=https://example.com/dress-back.jpg",
+                ],
+            )
+        )
+        self.assertEqual(["front", "back"], plan["reference_coverage"]["required_roles"])
+
+    def test_detail_generation_requires_detail_reference(self):
+        with self.assertRaises(studio.StudioError) as caught:
+            studio.create_plan(plan_args(types="detail"))
+        self.assertIn("detail", str(caught.exception))
+
+    def test_every_reference_requires_an_explicit_role(self):
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(reference_url=["https://example.com/product.jpg"]))
+
+    def test_sixteen_role_labeled_references_are_accepted(self):
+        references = ["front=https://example.com/%d.jpg" % index for index in range(16)]
+        plan = studio.create_plan(plan_args(reference_url=references))
+        self.assertEqual(16, len(plan["reference_views"]))
+        self.assertEqual(16, len(plan["jobs"][0]["request"]["image"]))
+        self.assertIn("image 16=front", plan["jobs"][0]["request"]["prompt"])
+
     def test_plan_accepts_local_reference_file(self):
         with tempfile.TemporaryDirectory() as directory:
             image_path = Path(directory) / "product.jpg"
             image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
-            plan = studio.create_plan(plan_args(reference_url=[], reference_file=[str(image_path)]))
+            plan = studio.create_plan(plan_args(reference_url=[], reference_file=["front=" + str(image_path)]))
         self.assertEqual(1, len(plan["reference_files"]))
         self.assertEqual("image/jpeg", plan["reference_files"][0]["mime_type"])
         self.assertEqual([], plan["jobs"][0]["request"]["image"])
@@ -137,7 +183,7 @@ class PlanTests(unittest.TestCase):
             image_path = Path(directory) / "product.png"
             image_path.write_bytes(b"\xff\xd8\xff" + b"not-a-png")
             with self.assertRaises(studio.StudioError):
-                studio.create_plan(plan_args(reference_url=[], reference_file=[str(image_path)]))
+                studio.create_plan(plan_args(reference_url=[], reference_file=["front=" + str(image_path)]))
 
     def test_combined_local_and_remote_references_are_limited(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -146,8 +192,8 @@ class PlanTests(unittest.TestCase):
             with self.assertRaises(studio.StudioError):
                 studio.create_plan(
                     plan_args(
-                        reference_url=["https://example.com/%d.jpg" % index for index in range(3)],
-                        reference_file=[str(image_path)],
+                        reference_url=["front=https://example.com/%d.jpg" % index for index in range(16)],
+                        reference_file=["detail=" + str(image_path)],
                     )
                 )
 
@@ -167,7 +213,7 @@ class PlanTests(unittest.TestCase):
                     "category": "家居",
                     "description": "白色方形产品",
                     "selling_points": ["容易清洁"],
-                    "reference_urls": ["https://example.com/product.jpg"],
+                    "reference_urls": [{"role": "front", "url": "https://example.com/product.jpg"}],
                     "platform": "Amazon US",
                     "types": "white_bg,lifestyle",
                     "size": "3:4",
@@ -211,6 +257,12 @@ class ResponseTests(unittest.TestCase):
             studio.extract_upload_url({"url": "https://cdn.example.com/reference.jpg"}),
         )
 
+    def test_upload_expiry_uses_response_and_24_hour_fallback(self):
+        self.assertEqual(7200, studio.extract_upload_expiry_seconds({"expires_in": 7200}))
+        self.assertEqual(86400, studio.extract_upload_expiry_seconds({}))
+        self.assertTrue(studio.upload_url_expired({"expires_at": "2000-01-01T00:00:00+00:00"}))
+        self.assertFalse(studio.upload_url_expired({"expires_at": "2999-01-01T00:00:00+00:00"}))
+
     def test_file_upload_uses_multipart_file_field(self):
         with tempfile.TemporaryDirectory() as directory:
             image_path = Path(directory) / "product.jpg"
@@ -241,13 +293,28 @@ class ResponseTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_live_generation_rejects_plan_without_fidelity_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = studio.create_plan(plan_args(types="hero"))
+            plan.pop("reference_coverage")
+            plan_path = root / "old-plan.json"
+            studio.write_json_atomic(plan_path, plan)
+            args = argparse.Namespace(
+                plan=str(plan_path), output_dir=str(root / "output"), max_points=10,
+                execute=True, wait=False, poll_interval=5, wait_timeout=900,
+                api_key_env="QIXUAI_API_KEY", confirm_live_run=True, timeout=30,
+            )
+            with self.assertRaises(studio.StudioError):
+                studio.command_generate(args)
+
     def test_generate_uploads_local_reference_once_and_uses_returned_url(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             image_path = root / "product.jpg"
             image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
             plan = studio.create_plan(
-                plan_args(types="white_bg", reference_url=[], reference_file=[str(image_path)])
+                plan_args(types="white_bg", reference_url=[], reference_file=["front=" + str(image_path)])
             )
             plan_path = root / "plan.json"
             output_dir = root / "output"
@@ -262,7 +329,7 @@ class WorkflowTests(unittest.TestCase):
 
                 def fake_upload(url, api_key, descriptor, timeout):
                     upload_calls.append(descriptor["path"])
-                    return {"url": "https://cdn.example.com/uploaded.jpg"}
+                    return {"url": "https://cdn.example.com/uploaded.jpg", "expires_in": 3600}
 
                 def fake_request(method, url, api_key, payload, timeout):
                     generation_payloads.append(payload)
@@ -277,6 +344,9 @@ class WorkflowTests(unittest.TestCase):
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
                     studio.command_generate(args)
+                    saved_manifest = studio.load_json(output_dir / "generation_manifest.json")
+                    saved_manifest["reference_uploads"][0]["expires_at"] = "2000-01-01T00:00:00+00:00"
+                    studio.write_json_atomic(output_dir / "generation_manifest.json", saved_manifest)
                     studio.command_generate(args)
             finally:
                 studio.request_file_upload = original_upload
@@ -290,6 +360,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(1, len(generation_payloads))
             self.assertEqual(["https://cdn.example.com/uploaded.jpg"], generation_payloads[0]["image"])
             self.assertEqual("uploaded", manifest["reference_uploads"][0]["status"])
+            self.assertEqual(3600, manifest["reference_uploads"][0]["expires_in"])
 
     def test_upload_rejects_file_changed_after_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -301,6 +372,39 @@ class WorkflowTests(unittest.TestCase):
                 studio.request_file_upload(
                     "https://token.qixuai.com/v1/images/uploads", "test-key", descriptor, 30
                 )
+
+    def test_expired_reference_is_reuploaded_for_pending_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            plan = studio.create_plan(
+                plan_args(types="white_bg", reference_url=[], reference_file=["front=" + str(image_path)])
+            )
+            manifest_path = root / "manifest.json"
+            manifest = studio.initial_manifest(plan, root / "plan.json")
+            manifest["reference_uploads"][0].update(
+                {
+                    "status": "uploaded",
+                    "url": "https://cdn.example.com/expired.jpg",
+                    "uploaded_at": "2000-01-01T00:00:00+00:00",
+                    "expires_at": "2000-01-02T00:00:00+00:00",
+                }
+            )
+            studio.write_json_atomic(manifest_path, manifest)
+            original_upload = studio.request_file_upload
+            calls = []
+            try:
+                def fake_upload(url, api_key, descriptor, timeout):
+                    calls.append(url)
+                    return {"url": "https://cdn.example.com/fresh.jpg", "expires_in": 86400}
+
+                studio.request_file_upload = fake_upload
+                urls = studio.upload_local_references(manifest, manifest_path, plan, "test-key", 30)
+            finally:
+                studio.request_file_upload = original_upload
+        self.assertEqual(1, len(calls))
+        self.assertEqual(["https://cdn.example.com/fresh.jpg"], urls)
 
     def test_generate_dry_run_does_not_create_output_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -467,7 +571,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(report["automatic_checks_passed"])
         self.assertEqual("简体中文", report["language"])
         self.assertEqual([], report["files"][0]["expected_copy"])
-        self.assertEqual(5, len(report["manual_review"]))
+        self.assertEqual(plan["reference_coverage"], report["reference_coverage"])
+        self.assertEqual(6, len(report["manual_review"]))
 
 
 if __name__ == "__main__":
