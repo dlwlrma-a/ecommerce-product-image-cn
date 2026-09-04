@@ -28,6 +28,9 @@ def plan_args(**overrides):
         "platform": "京东",
         "tone": "clean and premium",
         "language": "简体中文",
+        "audience": None,
+        "scene": None,
+        "copy": None,
         "types": "white_bg,hero,feature",
         "size": "1:1",
         "quality": "medium",
@@ -75,13 +78,40 @@ class PlanTests(unittest.TestCase):
         self.assertEqual("English", plan["language"])
         self.assertIn("visible copy in English", plan["jobs"][0]["request"]["prompt"])
 
-    def test_parser_defaults_to_rendered_simplified_chinese_copy(self):
+    def test_language_and_image_types_must_be_chosen(self):
         args = studio.build_parser().parse_args(["plan", "--output", "plan.json"])
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(types="hero", language=args.language, text_mode=args.text_mode))
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(types=None, language="简体中文", text_mode=args.text_mode))
+
+    def test_platform_and_image_size_must_be_chosen(self):
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(platform=None))
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(size=None))
+
+    def test_approved_copy_can_override_automatic_copy(self):
         plan = studio.create_plan(
-            plan_args(types="hero", language=None, text_mode=args.text_mode)
+            plan_args(types="hero", copy=["hero=轻盈随行", "hero=全天安心锁温"])
         )
-        self.assertEqual("render", plan["text_mode"])
-        self.assertEqual("简体中文", plan["language"])
+        self.assertEqual(["轻盈随行", "全天安心锁温"], plan["jobs"][0]["copy"])
+        prompt = plan["jobs"][0]["request"]["prompt"]
+        self.assertIn("轻盈随行 / 全天安心锁温", prompt)
+
+    def test_approved_copy_must_match_selected_rendered_types(self):
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(types="feature", copy=["hero=轻盈随行"]))
+        with self.assertRaises(studio.StudioError):
+            studio.create_plan(plan_args(types="hero", text_mode="reserve", copy=["hero=轻盈随行"]))
+
+    def test_audience_and_scene_are_added_to_relevant_prompt(self):
+        plan = studio.create_plan(
+            plan_args(types="lifestyle", audience="城市通勤人群", scene="早晨地铁通勤")
+        )
+        prompt = plan["jobs"][0]["request"]["prompt"]
+        self.assertIn("Target audience: 城市通勤人群", prompt)
+        self.assertIn("Requested use scene: 早晨地铁通勤", prompt)
 
     def test_rejects_more_than_three_references(self):
         references = ["https://example.com/%d.jpg" % index for index in range(4)]
@@ -138,6 +168,7 @@ class PlanTests(unittest.TestCase):
                     "description": "白色方形产品",
                     "selling_points": ["容易清洁"],
                     "reference_urls": ["https://example.com/product.jpg"],
+                    "platform": "Amazon US",
                     "types": "white_bg,lifestyle",
                     "size": "3:4",
                     "quality": "high",

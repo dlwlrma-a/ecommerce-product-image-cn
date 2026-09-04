@@ -8,6 +8,8 @@
   ],
   "dimensions": "容量 350 mL，高 17.5 cm",
   "platform": "京东",
+  "audience": "城市通勤人群",
+  "scene": "明亮整洁的早晨办公桌",
   "language": "简体中文",
   "text_mode": "render",
   "tone": "clean, modern, premium, credible",
@@ -17,5 +19,15 @@
   "reference_urls": [
     "https://example.com/product-front.jpg"
   ],
-  "reference_files": []
+  "reference_files": [],
+  "copy_by_type": {
+    "hero": [
+      "轻盈随行",
+      "全天安心锁温"
+    ],
+    "feature": [
+      "保温锁温",
+      "单手开合"
+    ]
+  }
 }

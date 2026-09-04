@@ -1,16 +1,24 @@
 ---
 name: 电商商品套图生成
-description: 根据商品原图、真实规格、卖点和目标语言生成带准确营销文案的电商主图、白底图、场景图、卖点图、细节图与尺寸参照图，并进行商品保真和图片规格检查。适用于淘宝、京东、拼多多、抖音、小红书、Amazon 和独立站商品视觉生产；不用于伪造商品功能、认证、价格、Logo 或未授权品牌素材。
+description: 先通过需求访谈确认商品、平台、受众、语言、套图类型、文案和视觉风格，再根据商品参考图生成并审计电商白底图、首图、场景图、卖点图、细节图与尺寸图。适用于淘宝、京东、拼多多、抖音、小红书、Amazon 和独立站；不用于未经确认就直接生图，或伪造商品事实与授权。
 slug: ecommerce-product-image-cn
 displayName: 电商商品套图生成
-version: 1.2.0
-summary: 根据商品原图、卖点和目标语言生成带文案的电商套图并完成质量检查
+version: 1.3.0
+summary: 先确认语言、图型与文案方案，再生成和审计电商商品套图
 license: MIT
 ---
 
 # 电商商品套图生成
 
 把商品图生产拆成可检查的商品档案、套图计划、异步生成任务和上架前审计。默认使用算点边界 `Qx-Image`，通过最多 3 张参考图保持同一 SKU 的外观一致性。
+
+## 对话门槛
+
+- 不要在用户只说“做一套商品图”或只上传参考图时直接生成。先使用 [需求访谈指南](references/intake-guide.md) 收集缺失信息。
+- 复用用户已经提供的内容，不重复询问。缺少关键信息时，用一条合并消息询问，优先给出可选项，避免逐题盘问。
+- `目标平台与用途`、`目标语言`、`套图类型` 和 `画面比例/尺寸` 没有静默默认值，必须由用户明确选择。用户说“你推荐”时，可以给出带理由的推荐方案，但仍要等用户确认。
+- 先展示“套图方案确认单”：商品与版本、平台、受众、语言、画面规格、逐图用途、准确文案、场景和保真风险。此阶段不调用上传或生图接口。
+- 只有用户明确确认方案后才能创建计划；随后展示上传张数、生成张数、端点和预计积分，再次获得执行确认后才能实际上传和生成。
 
 ## 边界
 
@@ -23,7 +31,7 @@ license: MIT
 
 ## 工作流
 
-1. 获取商品名称、品类、真实外观说明、1-3 张同款商品参考图、已核实卖点、尺寸、目标平台、画面比例和品牌调性。必须询问用户图片文字使用什么语言；默认建议简体中文，但不要替用户决定。需要翻译时确认目标语言，并要求用户复核译文含义。
+1. 按 [需求访谈指南](references/intake-guide.md) 获取商品名称与版本、品类、真实外观说明、1-3 张同款商品参考图、已核实卖点与尺寸、目标平台、受众、使用场景、目标语言、套图类型、画面规格和品牌调性。需要翻译时确认目标语言，并要求用户复核译文含义。
 2. 参考图可使用本地文件或模型服务能访问的 HTTPS URL。本地文件支持 PNG、JPG、JPEG、WEBP、GIF，单张不超过 10 MB；工具会按 [官方上传接口](https://token.qixuai.com/docs#image-upload)先上传，再把返回的 HTTPS URL 交给生图接口。本地文件和远程 URL 合计最多 3 张。
 3. 检查环境，密钥变量默认使用 `QIXUAI_API_KEY`：
 
@@ -31,10 +39,10 @@ license: MIT
    python scripts/ecommerce_image_studio.py doctor
    ```
 
-4. 先生成计划，不调用模型。图型和平台选择见 [references/image-types.md](references/image-types.md)：
+4. 将用户确认的方案写入商品档案，再生成计划；这一步不调用模型。图型选择见 [references/image-types.md](references/image-types.md)：
 
    ```powershell
-   python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --selling-point "保温锁温" --selling-point "单手开合" --reference-url "https://example.com/product-front.jpg" --platform "京东" --language "简体中文" --text-mode render --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
+   python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --selling-point "保温锁温" --selling-point "单手开合" --reference-url "https://example.com/product-front.jpg" --platform "京东" --audience "城市通勤人群" --scene "早晨办公桌" --language "简体中文" --text-mode render --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
    ```
 
    本地参考图使用 `--reference-file`，可重复传入；也可与 `--reference-url` 混用：
@@ -51,7 +59,7 @@ license: MIT
    python scripts/ecommerce_image_studio.py generate --plan image_plan.json --output-dir output
    ```
 
-6. 用户核对商品信息、提示词、目标域名和预算后才提交。当前接口说明见 [references/qixuai-image-api.md](references/qixuai-image-api.md)：
+6. 展示计划中的逐图用途、文案、商品状态、目标域名和预算。用户再次明确同意实际上传与扣费后才提交。当前接口说明见 [references/qixuai-image-api.md](references/qixuai-image-api.md)：
 
    ```powershell
    python scripts/ecommerce_image_studio.py generate --plan image_plan.json --output-dir output --max-points 50 --execute --confirm-live-run --wait

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
 MAX_REFERENCE_IMAGES = 3
@@ -219,6 +219,38 @@ def parse_types(value: str) -> List[str]:
     return requested
 
 
+def parse_copy_overrides(cli_values: Optional[List[str]], brief_value: Any) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    if cli_values is not None:
+        for item in cli_values:
+            image_type, separator, copy = item.partition("=")
+            image_type = image_type.strip()
+            if not separator or image_type not in TYPE_ORDER:
+                raise StudioError("Copy must use TYPE=TEXT with a supported image type")
+            result.setdefault(image_type, []).append(bounded_text(copy, "Visible copy", 120))
+    else:
+        if brief_value is None:
+            return result
+        if not isinstance(brief_value, dict):
+            raise StudioError("copy_by_type in the product brief must be an object")
+        for image_type, values in brief_value.items():
+            if image_type not in TYPE_ORDER:
+                raise StudioError("copy_by_type contains an unsupported image type: %s" % image_type)
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                raise StudioError("copy_by_type values must be strings or arrays")
+            result[image_type] = [bounded_text(str(value), "Visible copy", 120) for value in values]
+    for image_type, values in result.items():
+        if any(not value for value in values):
+            raise StudioError("Visible copy must not be empty")
+        if len(values) > 4:
+            raise StudioError("Each image can contain at most four approved copy phrases")
+        if image_type == "white_bg" and values:
+            raise StudioError("white_bg does not support overlay copy; use hero for a text-led main visual")
+    return result
+
+
 def product_lock(product: Dict[str, Any], has_references: bool) -> str:
     parts = [
         "The product is %s in category %s." % (product["name"], product["category"]),
@@ -244,6 +276,8 @@ def build_prompt(
     text_mode: str,
     language: str,
     visible_copy: List[str],
+    audience: str,
+    scene: str,
     has_references: bool,
 ) -> str:
     selling_points = product.get("selling_points") or []
@@ -258,6 +292,10 @@ def build_prompt(
         prompt.append("Only verified selling points: %s." % "; ".join(selling_points))
     if exact_dimensions:
         prompt.append("Verified product dimensions: %s." % exact_dimensions)
+    if audience:
+        prompt.append("Target audience: %s. Keep casting, styling, props, and visual hierarchy appropriate for them." % audience)
+    if scene and image_type in {"hero", "lifestyle"}:
+        prompt.append("Requested use scene: %s. Keep it realistic for the product and audience." % scene)
     if text_mode == "render" and visible_copy:
         prompt.append(
             "Render clear, correctly spelled visible copy in %s. Use each of these verified phrases once: %s. "
@@ -330,22 +368,44 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         raise StudioError("Product name and category are required")
     if not (references or reference_files or product["description"]):
         raise StudioError("Provide at least one reference image or a verified product description")
-    image_types = parse_types(args.types or str(brief.get("types") or ",".join(TYPE_ORDER)))
+    raw_types = getattr(args, "types", None) or brief.get("types")
+    if not raw_types:
+        raise StudioError("Choose the image types before creating a plan")
+    image_types = parse_types(str(raw_types))
     if not 1 <= args.points_per_image <= 10000:
         raise StudioError("Points per image estimate must be between 1 and 10000")
-    size = validate_size(args.size or str(brief.get("size") or "1:1"))
-    platform = bounded_text(args.platform or brief.get("platform"), "Platform", 80) or "通用电商平台"
+    raw_size = args.size or brief.get("size")
+    if not raw_size:
+        raise StudioError("Choose the image ratio or dimensions before creating a plan")
+    size = validate_size(str(raw_size))
+    platform = bounded_text(args.platform or brief.get("platform"), "Platform", 80)
+    if not platform:
+        raise StudioError("Choose the target platform and use before creating a plan")
     tone = bounded_text(args.tone or brief.get("tone"), "Visual tone", 240) or "clean, modern, credible, conversion-focused"
-    language = bounded_text(getattr(args, "language", None) or brief.get("language"), "Language", 80) or "简体中文"
+    language = bounded_text(getattr(args, "language", None) or brief.get("language"), "Language", 80)
+    if not language:
+        raise StudioError("Choose the visible copy language before creating a plan")
+    audience = bounded_text(getattr(args, "audience", None) or brief.get("audience"), "Audience", 240)
+    scene = bounded_text(getattr(args, "scene", None) or brief.get("scene"), "Scene", 300)
+    copy_overrides = parse_copy_overrides(getattr(args, "copy", None), brief.get("copy_by_type"))
     text_mode = getattr(args, "text_mode", None) or str(brief.get("text_mode") or "render")
     if text_mode not in {"reserve", "render", "none"}:
         raise StudioError("Text mode must be reserve, render, or none")
+    unused_copy_types = sorted(set(copy_overrides) - set(image_types))
+    if unused_copy_types:
+        raise StudioError("Approved copy was provided for unselected image types: %s" % ", ".join(unused_copy_types))
+    if copy_overrides and text_mode != "render":
+        raise StudioError("Approved visible copy requires text mode render")
     quality = args.quality or str(brief.get("quality") or "medium")
     if quality not in {"low", "medium", "high"}:
         raise StudioError("Quality must be low, medium, or high")
     jobs = []
     for position, image_type in enumerate(image_types, 1):
-        visible_copy = visible_copy_for_type(image_type, product) if text_mode == "render" else []
+        visible_copy = (
+            copy_overrides.get(image_type, visible_copy_for_type(image_type, product))
+            if text_mode == "render"
+            else []
+        )
         jobs.append(
             {
                 "job_id": "img-%02d" % position,
@@ -363,6 +423,8 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
                         text_mode,
                         language,
                         visible_copy,
+                        audience,
+                        scene,
                         bool(references or reference_files),
                     ),
                     "size": size,
@@ -379,6 +441,8 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "base_url": validate_base_url(args.base_url),
         "model": DEFAULT_MODEL,
         "platform": platform,
+        "audience": audience,
+        "scene": scene,
         "text_mode": text_mode,
         "language": language,
         "product": product,
@@ -1005,7 +1069,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--reference-file", action="append")
     plan.add_argument("--platform")
     plan.add_argument("--tone")
-    plan.add_argument("--language", help="Visible copy language; effective default: 简体中文")
+    plan.add_argument("--language", help="Required visible copy language, such as 简体中文 or English")
+    plan.add_argument("--audience")
+    plan.add_argument("--scene")
+    plan.add_argument("--copy", action="append", help="Approved visible copy in TYPE=TEXT format; repeat as needed")
     plan.add_argument("--types")
     plan.add_argument("--size")
     plan.add_argument("--quality", choices=("low", "medium", "high"))
