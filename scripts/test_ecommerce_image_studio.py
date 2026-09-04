@@ -24,6 +24,7 @@ def plan_args(**overrides):
         "selling_point": ["保温锁温", "单手开合"],
         "dimensions": "350 mL",
         "reference_url": ["https://assets.example.com/cup.jpg"],
+        "reference_file": None,
         "platform": "京东",
         "tone": "clean and premium",
         "types": "white_bg,hero,feature",
@@ -67,6 +68,35 @@ class PlanTests(unittest.TestCase):
     def test_rejects_insecure_reference(self):
         with self.assertRaises(studio.StudioError):
             studio.validate_reference_url("http://example.com/product.jpg")
+
+    def test_plan_accepts_local_reference_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            plan = studio.create_plan(plan_args(reference_url=[], reference_file=[str(image_path)]))
+        self.assertEqual(1, len(plan["reference_files"]))
+        self.assertEqual("image/jpeg", plan["reference_files"][0]["mime_type"])
+        self.assertEqual([], plan["jobs"][0]["request"]["image"])
+        self.assertIn("Preserve the product exactly", plan["jobs"][0]["request"]["prompt"])
+
+    def test_rejects_reference_file_with_mismatched_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "product.png"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"not-a-png")
+            with self.assertRaises(studio.StudioError):
+                studio.create_plan(plan_args(reference_url=[], reference_file=[str(image_path)]))
+
+    def test_combined_local_and_remote_references_are_limited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            with self.assertRaises(studio.StudioError):
+                studio.create_plan(
+                    plan_args(
+                        reference_url=["https://example.com/%d.jpg" % index for index in range(3)],
+                        reference_file=[str(image_path)],
+                    )
+                )
 
     def test_size_accepts_documented_ratios_and_custom_dimensions(self):
         self.assertEqual("3:4", studio.validate_size("3:4"))
@@ -117,8 +147,103 @@ class ResponseTests(unittest.TestCase):
     def test_task_state_is_normalized(self):
         self.assertEqual("succeeded", studio.extract_task_state({"data": {"status": "SUCCEEDED"}}))
 
+    def test_upload_url_accepts_documented_response(self):
+        self.assertEqual(
+            "https://cdn.example.com/reference.jpg",
+            studio.extract_upload_url({"url": "https://cdn.example.com/reference.jpg"}),
+        )
+
+    def test_file_upload_uses_multipart_file_field(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            descriptor = studio.describe_reference_file(str(image_path))
+            captured = {}
+
+            class FakeOpener:
+                def open(self, request, timeout):
+                    captured["request"] = request
+                    captured["timeout"] = timeout
+                    return io.BytesIO(b'{"url":"https://cdn.example.com/reference.jpg"}')
+
+            original_build_opener = studio.urllib.request.build_opener
+            try:
+                studio.urllib.request.build_opener = lambda *handlers: FakeOpener()
+                response = studio.request_file_upload(
+                    "https://token.qixuai.com/v1/images/uploads", "test-key", descriptor, 30
+                )
+            finally:
+                studio.urllib.request.build_opener = original_build_opener
+        request = captured["request"]
+        self.assertEqual("https://token.qixuai.com/v1/images/uploads", request.full_url)
+        self.assertIn("multipart/form-data; boundary=", request.get_header("Content-type"))
+        self.assertIn(b'name="file"', request.data)
+        self.assertIn(b'filename="reference.jpg"', request.data)
+        self.assertEqual("https://cdn.example.com/reference.jpg", response["url"])
+
 
 class WorkflowTests(unittest.TestCase):
+    def test_generate_uploads_local_reference_once_and_uses_returned_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            plan = studio.create_plan(
+                plan_args(types="white_bg", reference_url=[], reference_file=[str(image_path)])
+            )
+            plan_path = root / "plan.json"
+            output_dir = root / "output"
+            studio.write_json_atomic(plan_path, plan)
+            upload_calls = []
+            generation_payloads = []
+            original_upload = studio.request_file_upload
+            original_request = studio.request_json
+            original_key = os.environ.get("QIXUAI_API_KEY")
+            try:
+                os.environ["QIXUAI_API_KEY"] = "test-key"
+
+                def fake_upload(url, api_key, descriptor, timeout):
+                    upload_calls.append(descriptor["path"])
+                    return {"url": "https://cdn.example.com/uploaded.jpg"}
+
+                def fake_request(method, url, api_key, payload, timeout):
+                    generation_payloads.append(payload)
+                    return {"task_id": "task-1"}
+
+                studio.request_file_upload = fake_upload
+                studio.request_json = fake_request
+                args = argparse.Namespace(
+                    plan=str(plan_path), output_dir=str(output_dir), max_points=10,
+                    execute=True, wait=False, poll_interval=5, wait_timeout=900,
+                    api_key_env="QIXUAI_API_KEY", confirm_live_run=True, timeout=30,
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    studio.command_generate(args)
+                    studio.command_generate(args)
+            finally:
+                studio.request_file_upload = original_upload
+                studio.request_json = original_request
+                if original_key is None:
+                    os.environ.pop("QIXUAI_API_KEY", None)
+                else:
+                    os.environ["QIXUAI_API_KEY"] = original_key
+            manifest = studio.load_json(output_dir / "generation_manifest.json")
+            self.assertEqual(1, len(upload_calls))
+            self.assertEqual(1, len(generation_payloads))
+            self.assertEqual(["https://cdn.example.com/uploaded.jpg"], generation_payloads[0]["image"])
+            self.assertEqual("uploaded", manifest["reference_uploads"][0]["status"])
+
+    def test_upload_rejects_file_changed_after_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"first")
+            descriptor = studio.describe_reference_file(str(image_path))
+            image_path.write_bytes(b"\xff\xd8\xff" + b"changed")
+            with self.assertRaises(studio.StudioError):
+                studio.request_file_upload(
+                    "https://token.qixuai.com/v1/images/uploads", "test-key", descriptor, 30
+                )
+
     def test_generate_dry_run_does_not_create_output_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

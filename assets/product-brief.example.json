@@ -14,5 +14,6 @@
   "quality": "medium",
   "reference_urls": [
     "https://example.com/product-front.jpg"
-  ]
+  ],
+  "reference_files": []
 }

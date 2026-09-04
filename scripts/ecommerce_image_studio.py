@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.error
@@ -16,10 +17,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
 MAX_REFERENCE_IMAGES = 3
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_PROMPT_CHARS = 5000
 MAX_RESPONSE_BYTES = 5_000_000
 MAX_IMAGE_BYTES = 30_000_000
@@ -128,6 +130,63 @@ def validate_reference_url(value: str) -> str:
     return value.strip()
 
 
+def detect_reference_mime(path: Path, header: bytes) -> str:
+    suffix = path.suffix.lower()
+    expected = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(suffix)
+    if not expected:
+        raise StudioError("Reference file must be PNG, JPG, JPEG, WEBP, or GIF: %s" % path)
+    detected = None
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected = "image/png"
+    elif header.startswith(b"\xff\xd8\xff"):
+        detected = "image/jpeg"
+    elif header.startswith((b"GIF87a", b"GIF89a")):
+        detected = "image/gif"
+    elif len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        detected = "image/webp"
+    if detected != expected:
+        raise StudioError("Reference file content does not match its extension: %s" % path)
+    return expected
+
+
+def describe_reference_file(value: str, base_directory: Optional[Path] = None) -> Dict[str, Any]:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() and base_directory is not None:
+        candidate = base_directory / candidate
+    path = candidate.resolve()
+    try:
+        size = path.stat().st_size
+        if not path.is_file():
+            raise StudioError("Reference file is not a regular file: %s" % path)
+        if size <= 0:
+            raise StudioError("Reference file is empty: %s" % path)
+        if size > MAX_UPLOAD_BYTES:
+            raise StudioError("Reference file exceeds the 10 MB upload limit: %s" % path)
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            header = handle.read(16)
+            digest.update(header)
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise StudioError("Cannot read reference file %s: %s" % (path, exc)) from exc
+    return {
+        "path": str(path),
+        "size_bytes": size,
+        "sha256": digest.hexdigest(),
+        "mime_type": detect_reference_mime(path, header),
+    }
+
+
 def validate_size(value: str) -> str:
     value = value.strip().lower()
     if value in {"1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4"}:
@@ -218,12 +277,22 @@ def build_prompt(
 
 
 def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
-    brief = load_json(Path(args.brief)) if getattr(args, "brief", None) else {}
+    brief_path = Path(args.brief).resolve() if getattr(args, "brief", None) else None
+    brief = load_json(brief_path) if brief_path else {}
     raw_references = args.reference_url if args.reference_url is not None else brief.get("reference_urls", [])
     if not isinstance(raw_references, list):
         raise StudioError("reference_urls in the product brief must be an array")
     references = [validate_reference_url(str(value)) for value in raw_references]
-    if len(references) > MAX_REFERENCE_IMAGES:
+    raw_reference_files = (
+        getattr(args, "reference_file", None)
+        if getattr(args, "reference_file", None) is not None
+        else brief.get("reference_files", [])
+    )
+    if not isinstance(raw_reference_files, list):
+        raise StudioError("reference_files in the product brief must be an array")
+    file_base = brief_path.parent if brief_path and getattr(args, "reference_file", None) is None else None
+    reference_files = [describe_reference_file(str(value), file_base) for value in raw_reference_files]
+    if len(references) + len(reference_files) > MAX_REFERENCE_IMAGES:
         raise StudioError("Qx-Image accepts at most %d reference images" % MAX_REFERENCE_IMAGES)
     raw_selling_points = args.selling_point if args.selling_point is not None else brief.get("selling_points", [])
     if not isinstance(raw_selling_points, list):
@@ -237,8 +306,8 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     }
     if not product["name"] or not product["category"]:
         raise StudioError("Product name and category are required")
-    if not (references or product["description"]):
-        raise StudioError("Provide at least one reference URL or a verified product description")
+    if not (references or reference_files or product["description"]):
+        raise StudioError("Provide at least one reference image or a verified product description")
     image_types = parse_types(args.types or str(brief.get("types") or ",".join(TYPE_ORDER)))
     if not 1 <= args.points_per_image <= 10000:
         raise StudioError("Points per image estimate must be between 1 and 10000")
@@ -259,7 +328,9 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
                 "copy": product["selling_points"][:3] if image_type in {"hero", "feature", "size_reference"} else [],
                 "request": {
                     "model": DEFAULT_MODEL,
-                    "prompt": build_prompt(image_type, product, platform, tone, args.text_mode, bool(references)),
+                    "prompt": build_prompt(
+                        image_type, product, platform, tone, args.text_mode, bool(references or reference_files)
+                    ),
                     "size": size,
                     "quality": quality,
                     "image": references,
@@ -267,7 +338,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generator_version": VERSION,
         "created_at": now_iso(),
         "provider": "算点边界",
@@ -277,6 +348,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "text_mode": args.text_mode,
         "product": product,
         "reference_images": references,
+        "reference_files": reference_files,
         "points_per_image_estimate": args.points_per_image,
         "estimated_points": args.points_per_image * len(jobs),
         "jobs": jobs,
@@ -295,7 +367,7 @@ def command_plan(args: argparse.Namespace) -> None:
                 "output": str(output),
                 "images": len(plan["jobs"]),
                 "estimated_points": plan["estimated_points"],
-                "reference_images": len(plan["reference_images"]),
+                "reference_images": len(plan["reference_images"]) + len(plan.get("reference_files") or []),
             },
             ensure_ascii=False,
         )
@@ -336,6 +408,68 @@ def request_json(method: str, url: str, api_key: str, payload: Optional[Dict[str
     if not isinstance(value, dict):
         raise StudioError("API returned a non-object JSON response")
     return value
+
+
+def verify_reference_descriptor(descriptor: Dict[str, Any]) -> Dict[str, Any]:
+    current = describe_reference_file(str(descriptor.get("path") or ""))
+    for field in ("size_bytes", "sha256", "mime_type"):
+        if current[field] != descriptor.get(field):
+            raise StudioError("Reference file changed after the plan was created: %s" % current["path"])
+    return current
+
+
+def request_file_upload(url: str, api_key: str, descriptor: Dict[str, Any], timeout: int) -> Dict[str, Any]:
+    current = verify_reference_descriptor(descriptor)
+    path = Path(current["path"])
+    boundary = "----ecommerce-image-studio-" + secrets.token_hex(16)
+    safe_name = "reference" + path.suffix.lower()
+    prefix = (
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: %s\r\n\r\n" % (boundary, safe_name, current["mime_type"])
+    ).encode("ascii")
+    body = prefix + path.read_bytes() + ("\r\n--%s--\r\n" % boundary).encode("ascii")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Accept": "application/json",
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            "User-Agent": "ecommerce-product-image-cn/%s" % VERSION,
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            data = read_limited(response, MAX_RESPONSE_BYTES)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1200).decode("utf-8", errors="replace")
+        raise StudioError("Image upload failed with HTTP %d: %s" % (exc.code, detail[:1200])) from exc
+    except urllib.error.URLError as exc:
+        raise StudioError("Image upload failed: %s" % exc.reason) from exc
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StudioError("Image upload returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise StudioError("Image upload returned a non-object JSON response")
+    return value
+
+
+def extract_upload_url(response: Dict[str, Any]) -> Optional[str]:
+    candidates = [response.get("url")]
+    data = response.get("data")
+    if isinstance(data, dict):
+        candidates.extend([data.get("url"), data.get("image_url")])
+    for value in candidates:
+        if isinstance(value, str):
+            try:
+                return validate_reference_url(value)
+            except StudioError:
+                continue
+    return None
 
 
 def nested_values(value: Any, keys: Iterable[str]) -> Iterable[Any]:
@@ -421,13 +555,23 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generator_version": VERSION,
         "plan": str(plan_path),
         "plan_sha256": plan_fingerprint(plan),
         "base_url": plan["base_url"],
         "model": plan["model"],
         "reference_images": plan.get("reference_images") or [],
+        "reference_uploads": [
+            {
+                **descriptor,
+                "status": "not_uploaded",
+                "url": None,
+                "uploaded_at": None,
+                "updated_at": None,
+            }
+            for descriptor in (plan.get("reference_files") or [])
+        ],
         "created_at": now_iso(),
         "jobs": rows,
     }
@@ -442,6 +586,80 @@ def load_or_create_manifest(path: Path, plan: Dict[str, Any], plan_path: Path) -
     return initial_manifest(plan, plan_path)
 
 
+def upload_local_references(
+    manifest: Dict[str, Any], manifest_path: Path, plan: Dict[str, Any], api_key: str, timeout: int
+) -> List[str]:
+    direct_urls = [validate_reference_url(str(value)) for value in (plan.get("reference_images") or [])]
+    uploads = manifest.get("reference_uploads")
+    if uploads is None:
+        uploads = [
+            {
+                **descriptor,
+                "status": "not_uploaded",
+                "url": None,
+                "uploaded_at": None,
+                "updated_at": None,
+            }
+            for descriptor in (plan.get("reference_files") or [])
+        ]
+        manifest["reference_uploads"] = uploads
+        write_json_atomic(manifest_path, manifest)
+    if not isinstance(uploads, list) or len(uploads) != len(plan.get("reference_files") or []):
+        raise StudioError("Manifest reference uploads do not match the generation plan")
+    upload_endpoint = api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/uploads")
+    uploaded_urls = []
+    for row in uploads:
+        status = row.get("status")
+        if status == "uploaded":
+            url = extract_upload_url({"url": row.get("url")})
+            if not url:
+                raise StudioError("Manifest contains an invalid uploaded reference URL")
+            uploaded_urls.append(url)
+            continue
+        if status in {"uploading", "upload_unknown"}:
+            raise StudioError(
+                "A previous reference upload has an unknown outcome. Check uploaded files before creating a new plan "
+                "or replacing it with a known --reference-url: %s" % row.get("path")
+            )
+        if status != "not_uploaded":
+            raise StudioError("Manifest contains an unsupported reference upload status: %s" % status)
+        verify_reference_descriptor(row)
+        row["status"] = "uploading"
+        row["updated_at"] = now_iso()
+        write_json_atomic(manifest_path, manifest)
+        try:
+            response = request_file_upload(upload_endpoint, api_key, row, timeout)
+        except StudioError as exc:
+            row["status"] = "upload_unknown"
+            row["updated_at"] = now_iso()
+            row["error"] = str(exc)
+            write_json_atomic(manifest_path, manifest)
+            raise StudioError(
+                "Reference upload outcome is unknown. Manifest was saved; check uploaded files before retrying."
+            ) from exc
+        url = extract_upload_url(response)
+        if not url:
+            row["status"] = "upload_unknown"
+            row["updated_at"] = now_iso()
+            row["upload_response"] = response
+            write_json_atomic(manifest_path, manifest)
+            raise StudioError("Reference upload returned no HTTPS URL; response was saved for inspection")
+        row["status"] = "uploaded"
+        row["url"] = url
+        row["uploaded_at"] = now_iso()
+        row["updated_at"] = row["uploaded_at"]
+        row.pop("error", None)
+        manifest["reference_images"] = direct_urls + uploaded_urls + [url]
+        write_json_atomic(manifest_path, manifest)
+        uploaded_urls.append(url)
+    combined = direct_urls + uploaded_urls
+    if len(combined) > MAX_REFERENCE_IMAGES:
+        raise StudioError("Qx-Image accepts at most %d reference images" % MAX_REFERENCE_IMAGES)
+    manifest["reference_images"] = combined
+    write_json_atomic(manifest_path, manifest)
+    return combined
+
+
 def command_generate(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan).resolve()
     plan = load_json(plan_path)
@@ -454,8 +672,11 @@ def command_generate(args: argparse.Namespace) -> None:
     preview = {
         "mode": "dry-run" if not args.execute else "execute",
         "endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true"),
+        "upload_endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/uploads"),
         "model": plan.get("model"),
         "images": len(jobs),
+        "local_reference_uploads": len(plan.get("reference_files") or []),
+        "remote_reference_urls": len(plan.get("reference_images") or []),
         "estimated_points": estimate,
         "manifest": str(manifest_path),
     }
@@ -471,6 +692,7 @@ def command_generate(args: argparse.Namespace) -> None:
     manifest = load_or_create_manifest(manifest_path, plan, plan_path)
     manifest_rows = {row["job_id"]: row for row in manifest["jobs"]}
     endpoint = api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true")
+    reference_urls = upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
     submitted = 0
     for job in jobs:
         row = manifest_rows.get(job["job_id"])
@@ -478,8 +700,10 @@ def command_generate(args: argparse.Namespace) -> None:
             raise StudioError("Manifest is missing job %s" % job["job_id"])
         if row.get("task_id") or row.get("status") != "not_submitted":
             continue
+        payload = dict(job["request"])
+        payload["image"] = reference_urls
         try:
-            response = request_json("POST", endpoint, api_key, job["request"], args.timeout)
+            response = request_json("POST", endpoint, api_key, payload, args.timeout)
         except StudioError:
             row["status"] = "submit_unknown"
             row["updated_at"] = now_iso()
@@ -734,6 +958,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--selling-point", action="append")
     plan.add_argument("--dimensions")
     plan.add_argument("--reference-url", action="append")
+    plan.add_argument("--reference-file", action="append")
     plan.add_argument("--platform")
     plan.add_argument("--tone")
     plan.add_argument("--types")
