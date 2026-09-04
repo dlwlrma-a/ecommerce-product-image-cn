@@ -1,0 +1,18 @@
+{
+  "product_name": "便携咖啡杯",
+  "category": "饮具",
+  "description": "磨砂黑色直筒杯身，不锈钢内胆，黑色旋盖",
+  "selling_points": [
+    "保温锁温",
+    "单手开合"
+  ],
+  "dimensions": "容量 350 mL，高 17.5 cm",
+  "platform": "京东",
+  "tone": "clean, modern, premium, credible",
+  "types": "white_bg,hero,lifestyle,feature,detail",
+  "size": "1:1",
+  "quality": "medium",
+  "reference_urls": [
+    "https://example.com/product-front.jpg"
+  ]
+}
