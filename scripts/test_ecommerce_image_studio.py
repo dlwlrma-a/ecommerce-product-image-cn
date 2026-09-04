@@ -27,10 +27,11 @@ def plan_args(**overrides):
         "reference_file": None,
         "platform": "京东",
         "tone": "clean and premium",
+        "language": "简体中文",
         "types": "white_bg,hero,feature",
         "size": "1:1",
         "quality": "medium",
-        "text_mode": "reserve",
+        "text_mode": "render",
         "points_per_image": 10,
         "base_url": studio.DEFAULT_BASE_URL,
         "output": "plan.json",
@@ -59,6 +60,28 @@ class PlanTests(unittest.TestCase):
         prompt = plan["jobs"][0]["request"]["prompt"]
         self.assertIn("保温锁温 / 单手开合", prompt)
         self.assertIn("Do not add any other", prompt)
+
+    def test_render_mode_assigns_copy_by_image_type(self):
+        plan = studio.create_plan(plan_args(types="white_bg,hero,lifestyle,feature,detail,size_reference"))
+        copy_by_type = {job["type"]: job["copy"] for job in plan["jobs"]}
+        self.assertEqual([], copy_by_type["white_bg"])
+        self.assertEqual(["便携咖啡杯", "保温锁温", "单手开合"], copy_by_type["hero"])
+        self.assertEqual(["便携咖啡杯", "保温锁温"], copy_by_type["lifestyle"])
+        self.assertEqual(["保温锁温", "单手开合"], copy_by_type["feature"])
+        self.assertEqual(["便携咖啡杯", "350 mL"], copy_by_type["size_reference"])
+
+    def test_requested_copy_language_is_in_prompt(self):
+        plan = studio.create_plan(plan_args(types="hero", language="English"))
+        self.assertEqual("English", plan["language"])
+        self.assertIn("visible copy in English", plan["jobs"][0]["request"]["prompt"])
+
+    def test_parser_defaults_to_rendered_simplified_chinese_copy(self):
+        args = studio.build_parser().parse_args(["plan", "--output", "plan.json"])
+        plan = studio.create_plan(
+            plan_args(types="hero", language=None, text_mode=args.text_mode)
+        )
+        self.assertEqual("render", plan["text_mode"])
+        self.assertEqual("简体中文", plan["language"])
 
     def test_rejects_more_than_three_references(self):
         references = ["https://example.com/%d.jpg" % index for index in range(4)]
@@ -118,18 +141,22 @@ class PlanTests(unittest.TestCase):
                     "types": "white_bg,lifestyle",
                     "size": "3:4",
                     "quality": "high",
+                    "language": "English",
+                    "text_mode": "reserve",
                 },
             )
             args = plan_args(
                 brief=str(brief_path), product_name=None, category=None, description=None,
                 selling_point=None, dimensions=None, reference_url=None, platform=None,
-                tone=None, types=None, size=None, quality=None,
+                tone=None, language=None, types=None, size=None, quality=None, text_mode=None,
             )
             plan = studio.create_plan(args)
         self.assertEqual("测试商品", plan["product"]["name"])
         self.assertEqual(2, len(plan["jobs"]))
         self.assertEqual("3:4", plan["jobs"][0]["request"]["size"])
         self.assertEqual("high", plan["jobs"][0]["request"]["quality"])
+        self.assertEqual("English", plan["language"])
+        self.assertEqual("reserve", plan["text_mode"])
 
 
 class ResponseTests(unittest.TestCase):
@@ -407,6 +434,8 @@ class WorkflowTests(unittest.TestCase):
                 studio.command_audit(args)
             report = studio.load_json(report_path)
         self.assertTrue(report["automatic_checks_passed"])
+        self.assertEqual("简体中文", report["language"])
+        self.assertEqual([], report["files"][0]["expected_copy"])
         self.assertEqual(5, len(report["manual_review"]))
 
 

@@ -1,13 +1,13 @@
 # 电商商品套图生成
 
-面向国内与跨境电商的商品套图生成 Skill。它把商品原图和真实卖点整理成可检查计划，通过算点边界 `Qx-Image` 异步生成白底主图、氛围首图、场景图、卖点图、细节图和尺寸参照图，并保存任务清单用于断点续查。
+面向国内与跨境电商的商品套图生成 Skill。它把商品原图、真实卖点和目标语言整理成可检查计划，通过算点边界 `Qx-Image` 异步生成带准确营销文案的白底主图、氛围首图、场景图、卖点图、细节图和尺寸参照图，并保存任务清单用于断点续查。
 
-核心特点：本地参考图自动上传、最多 3 张商品参考图、商品保真锁定段、默认无文字底图、积分预算上限、提交不自动重试、规格和白底检测。
+核心特点：本地参考图自动上传、最多 3 张商品参考图、默认渲染简体中文并支持指定其他语言、按图型分配文案、商品保真锁定段、积分预算上限、提交不自动重试、规格和白底检测。
 
 ```powershell
 python scripts/ecommerce_image_studio.py doctor
-python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --selling-point "保温锁温" --reference-url "https://example.com/product.jpg" --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
-python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --reference-file ".\product-front.jpg" --reference-file ".\product-side.png" --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
+python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --selling-point "保温锁温" --reference-url "https://example.com/product.jpg" --language "简体中文" --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
+python scripts/ecommerce_image_studio.py plan --product-name "便携咖啡杯" --category "饮具" --description "磨砂黑色杯身，不锈钢内胆，黑色旋盖" --reference-file ".\product-front.jpg" --reference-file ".\product-side.png" --language "简体中文" --types white_bg,hero,lifestyle,feature,detail --size 1:1 --output image_plan.json
 python scripts/ecommerce_image_studio.py plan --brief assets/product-brief.example.json --output image_plan.json
 python scripts/ecommerce_image_studio.py generate --plan image_plan.json --output-dir output
 ```

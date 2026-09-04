@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
 MAX_REFERENCE_IMAGES = 3
@@ -242,6 +242,8 @@ def build_prompt(
     platform: str,
     tone: str,
     text_mode: str,
+    language: str,
+    visible_copy: List[str],
     has_references: bool,
 ) -> str:
     selling_points = product.get("selling_points") or []
@@ -256,13 +258,14 @@ def build_prompt(
         prompt.append("Only verified selling points: %s." % "; ".join(selling_points))
     if exact_dimensions:
         prompt.append("Verified product dimensions: %s." % exact_dimensions)
-    if text_mode == "render" and selling_points and image_type in {"hero", "feature", "size_reference"}:
-        short_copy = [point[:18] for point in selling_points[:3]]
+    if text_mode == "render" and visible_copy:
         prompt.append(
-            "Render only this exact Simplified Chinese copy, spelled exactly and legibly: %s. "
-            "Do not add any other words, numbers, badges, or claims." % " / ".join(short_copy)
+            "Render clear, correctly spelled visible copy in %s. Use each of these verified phrases once: %s. "
+            "Keep phrases exactly as supplied when they already use the target language; otherwise translate faithfully "
+            "without changing meaning. Build a professional headline and callout hierarchy. Do not add any other words, "
+            "numbers, badges, or claims." % (language, " / ".join(visible_copy))
         )
-    elif text_mode == "reserve" and image_type in {"hero", "feature", "size_reference"}:
+    elif text_mode == "reserve" and image_type != "white_bg":
         prompt.append("Leave clean negative space for later copy layout. Do not render any text, letters, numbers, or badges.")
     else:
         prompt.append("No text, letters, numbers, badges, watermarks, borders, or marketplace UI.")
@@ -274,6 +277,25 @@ def build_prompt(
     if len(result) > MAX_PROMPT_CHARS:
         raise StudioError("Generated prompt exceeds the Qx-Image 5000-character limit")
     return result
+
+
+def visible_copy_for_type(image_type: str, product: Dict[str, Any]) -> List[str]:
+    name = str(product.get("name") or "").strip()
+    selling_points = [str(value).strip() for value in (product.get("selling_points") or []) if str(value).strip()]
+    dimensions = str(product.get("dimensions") or "").strip()
+    if image_type == "white_bg":
+        return []
+    if image_type == "hero":
+        return ([name] if name else []) + selling_points[:2]
+    if image_type == "lifestyle":
+        return ([name] if name else []) + selling_points[:1]
+    if image_type == "feature":
+        return selling_points[:3] or ([name] if name else [])
+    if image_type == "detail":
+        return ([name] if name else []) + selling_points[:1]
+    if image_type == "size_reference":
+        return ([name] if name else []) + ([dimensions] if dimensions else [])
+    return []
 
 
 def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
@@ -314,22 +336,34 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     size = validate_size(args.size or str(brief.get("size") or "1:1"))
     platform = bounded_text(args.platform or brief.get("platform"), "Platform", 80) or "通用电商平台"
     tone = bounded_text(args.tone or brief.get("tone"), "Visual tone", 240) or "clean, modern, credible, conversion-focused"
+    language = bounded_text(getattr(args, "language", None) or brief.get("language"), "Language", 80) or "简体中文"
+    text_mode = getattr(args, "text_mode", None) or str(brief.get("text_mode") or "render")
+    if text_mode not in {"reserve", "render", "none"}:
+        raise StudioError("Text mode must be reserve, render, or none")
     quality = args.quality or str(brief.get("quality") or "medium")
     if quality not in {"low", "medium", "high"}:
         raise StudioError("Quality must be low, medium, or high")
     jobs = []
     for position, image_type in enumerate(image_types, 1):
+        visible_copy = visible_copy_for_type(image_type, product) if text_mode == "render" else []
         jobs.append(
             {
                 "job_id": "img-%02d" % position,
                 "index": position,
                 "type": image_type,
                 "label": TYPE_LABELS[image_type],
-                "copy": product["selling_points"][:3] if image_type in {"hero", "feature", "size_reference"} else [],
+                "copy": visible_copy,
                 "request": {
                     "model": DEFAULT_MODEL,
                     "prompt": build_prompt(
-                        image_type, product, platform, tone, args.text_mode, bool(references or reference_files)
+                        image_type,
+                        product,
+                        platform,
+                        tone,
+                        text_mode,
+                        language,
+                        visible_copy,
+                        bool(references or reference_files),
                     ),
                     "size": size,
                     "quality": quality,
@@ -345,7 +379,8 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "base_url": validate_base_url(args.base_url),
         "model": DEFAULT_MODEL,
         "platform": platform,
-        "text_mode": args.text_mode,
+        "text_mode": text_mode,
+        "language": language,
         "product": product,
         "reference_images": references,
         "reference_files": reference_files,
@@ -883,6 +918,7 @@ def command_audit(args: argparse.Namespace) -> None:
     plan = load_json(Path(args.plan))
     manifest = load_json(Path(args.manifest))
     expected_by_type = {job["type"]: expected_ratio(str(job["request"]["size"])) for job in plan.get("jobs") or []}
+    copy_by_type = {job["type"]: job.get("copy") or [] for job in plan.get("jobs") or []}
     rows = []
     for job in manifest.get("jobs") or []:
         for value in job.get("files") or []:
@@ -890,6 +926,7 @@ def command_audit(args: argparse.Namespace) -> None:
             inspected = inspect_with_pillow(path, job.get("type") == "white_bg")
             inspected["job_id"] = job.get("job_id")
             inspected["type"] = job.get("type")
+            inspected["expected_copy"] = copy_by_type.get(job.get("type"), [])
             if "width" in inspected and "height" in inspected:
                 actual = inspected["width"] / inspected["height"]
                 expected = expected_by_type.get(job.get("type"))
@@ -901,6 +938,7 @@ def command_audit(args: argparse.Namespace) -> None:
     report = {
         "schema_version": 1,
         "audited_at": now_iso(),
+        "language": plan.get("language") or "简体中文",
         "files": rows,
         "automatic_checks_passed": bool(rows) and all(
             not row.get("error")
@@ -912,7 +950,7 @@ def command_audit(args: argparse.Namespace) -> None:
         "manual_review": [
             "商品轮廓、比例、颜色、材质、Logo、标签和包装与原图一致",
             "未生成不存在的配件、功能、认证、价格、功效或促销承诺",
-            "中文文案无错字，尺寸与单位来自已核实数据",
+            "逐字核对 expected_copy：目标语言正确、无错字漏字、无额外文案，尺寸与单位来自已核实数据",
             "场景中的使用方式、人物接触关系和产品尺度真实合理",
             "图片符合目标平台当前上架规则并拥有素材使用权",
         ],
@@ -967,10 +1005,13 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--reference-file", action="append")
     plan.add_argument("--platform")
     plan.add_argument("--tone")
+    plan.add_argument("--language", help="Visible copy language; effective default: 简体中文")
     plan.add_argument("--types")
     plan.add_argument("--size")
     plan.add_argument("--quality", choices=("low", "medium", "high"))
-    plan.add_argument("--text-mode", choices=("reserve", "render", "none"), default="reserve")
+    plan.add_argument(
+        "--text-mode", choices=("reserve", "render", "none"), help="Copy strategy; effective default: render"
+    )
     plan.add_argument("--points-per-image", type=int, default=10)
     plan.add_argument("--base-url", default=DEFAULT_BASE_URL)
     plan.add_argument("--output", required=True)
