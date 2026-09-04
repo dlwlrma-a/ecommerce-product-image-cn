@@ -1,9 +1,9 @@
 ---
-name: ecommerce-product-image-cn
+name: 电商商品套图生成
 description: 根据商品原图、真实规格和卖点生成电商主图、白底图、场景图、卖点图、细节图与尺寸参照图，并进行商品保真和图片规格检查。适用于淘宝、京东、拼多多、抖音、小红书、Amazon 和独立站商品视觉生产；不用于伪造商品功能、认证、价格、Logo 或未授权品牌素材。
 slug: ecommerce-product-image-cn
 displayName: 电商商品套图生成
-version: 1.0.1
+version: 1.0.2
 summary: 根据商品原图和卖点生成主图、场景图、卖点图并完成质量检查
 license: MIT
 ---
