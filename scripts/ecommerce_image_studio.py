@@ -421,6 +421,12 @@ def verify_reference_descriptor(descriptor: Dict[str, Any]) -> Dict[str, Any]:
 def request_file_upload(url: str, api_key: str, descriptor: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     current = verify_reference_descriptor(descriptor)
     path = Path(current["path"])
+    try:
+        file_data = path.read_bytes()
+    except OSError as exc:
+        raise StudioError("Cannot read reference file %s: %s" % (path, exc)) from exc
+    if len(file_data) != descriptor.get("size_bytes") or hashlib.sha256(file_data).hexdigest() != descriptor.get("sha256"):
+        raise StudioError("Reference file changed while it was being prepared for upload: %s" % path)
     boundary = "----ecommerce-image-studio-" + secrets.token_hex(16)
     safe_name = "reference" + path.suffix.lower()
     prefix = (
@@ -428,7 +434,7 @@ def request_file_upload(url: str, api_key: str, descriptor: Dict[str, Any], time
         "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
         "Content-Type: %s\r\n\r\n" % (boundary, safe_name, current["mime_type"])
     ).encode("ascii")
-    body = prefix + path.read_bytes() + ("\r\n--%s--\r\n" % boundary).encode("ascii")
+    body = prefix + file_data + ("\r\n--%s--\r\n" % boundary).encode("ascii")
     request = urllib.request.Request(
         url,
         data=body,
