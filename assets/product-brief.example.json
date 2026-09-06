@@ -13,9 +13,44 @@
   "language": "简体中文",
   "text_mode": "render",
   "tone": "clean, modern, premium, credible",
-  "types": "white_bg,hero,lifestyle,feature,detail",
   "size": "1:1",
   "quality": "medium",
+  "shots": [
+    {
+      "id": "catalog-main",
+      "type": "white_bg",
+      "direction": "商品完整居中，保留自然接触阴影",
+      "reference_roles": ["front"]
+    },
+    {
+      "id": "hero-commute",
+      "type": "hero",
+      "scene": "明亮整洁的早晨办公桌",
+      "direction": "杯身居左，右侧为标题留出清晰层级",
+      "copy": ["轻盈随行", "全天安心锁温"],
+      "reference_roles": ["front", "detail"]
+    },
+    {
+      "id": "feature-insulation",
+      "type": "feature",
+      "direction": "以温度感和杯体剖面式视觉语言表达保温，但不虚构内部结构",
+      "copy": ["保温锁温"],
+      "reference_roles": ["front", "detail"]
+    },
+    {
+      "id": "feature-open",
+      "type": "feature",
+      "direction": "突出旋盖和单手开合动作，结构必须与参考图一致",
+      "copy": ["单手开合"],
+      "reference_roles": ["front", "detail"]
+    },
+    {
+      "id": "detail-finish",
+      "type": "detail",
+      "direction": "微距展示磨砂表面与旋盖细节",
+      "reference_roles": ["detail"]
+    }
+  ],
   "reference_urls": [
     {
       "role": "front",
@@ -30,15 +65,5 @@
   "required_views": [
     "front",
     "detail"
-  ],
-  "copy_by_type": {
-    "hero": [
-      "轻盈随行",
-      "全天安心锁温"
-    ],
-    "feature": [
-      "保温锁温",
-      "单手开合"
-    ]
-  }
+  ]
 }

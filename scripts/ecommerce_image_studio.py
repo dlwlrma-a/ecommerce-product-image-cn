@@ -13,14 +13,26 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import qixuai_auth
 
-VERSION = "1.4.0"
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+
+
+VERSION = "1.7.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
+BALANCE_ENDPOINT = "https://token.qixuai.com/api/billing/balance"
+QUOTE_ENDPOINT = "https://token.qixuai.com/api/billing/quotes/image-generation"
+RECHARGE_URL = "https://token.qixuai.com/console/recharge?intent=buy"
 MAX_REFERENCE_IMAGES = 16
+MAX_JOBS = 16
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_PROMPT_CHARS = 5000
 MAX_RESPONSE_BYTES = 5_000_000
@@ -97,6 +109,29 @@ APPAREL_KEYWORDS = (
 
 class StudioError(RuntimeError):
     pass
+
+
+class InsufficientCreditsError(StudioError):
+    def __init__(
+        self,
+        balance: Any,
+        required: Any,
+        recharge_url: str = RECHARGE_URL,
+    ) -> None:
+        self.balance = decimal_credits(balance, "balance")
+        self.required = decimal_credits(required, "required")
+        self.shortfall = max(Decimal("0"), self.required - self.balance)
+        self.recharge_url = trusted_recharge_url(recharge_url)
+        super().__init__(
+            "积分余额不足：当前 %s 积分，本次待提交任务预计需要 %s 积分，还差 %s 积分。"
+            "任务已暂停，请充值后回复“继续”：%s"
+            % (
+                format_credits(self.balance),
+                format_credits(self.required),
+                format_credits(self.shortfall),
+                self.recharge_url,
+            )
+        )
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -273,16 +308,35 @@ def bounded_text(value: Optional[str], label: str, maximum: int) -> str:
     return cleaned
 
 
-def parse_types(value: str) -> List[str]:
-    requested = [item.strip() for item in value.split(",") if item.strip()]
+def parse_types(value: Any) -> List[str]:
+    if isinstance(value, str):
+        requested = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        requested = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raise StudioError("Image types must be a comma-separated string or an array")
     unknown = [item for item in requested if item not in TYPE_ORDER]
     if unknown:
         raise StudioError("Unknown image types: %s" % ", ".join(unknown))
     if not requested:
         raise StudioError("At least one image type is required")
-    if len(set(requested)) != len(requested):
-        raise StudioError("Image types must not be repeated")
+    if len(requested) > MAX_JOBS:
+        raise StudioError("A plan can contain at most %d image jobs" % MAX_JOBS)
     return requested
+
+
+def parse_copy_list(value: Any, label: str = "Visible copy") -> List[str]:
+    if value is None:
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list):
+        raise StudioError("%s must be a string or an array" % label)
+    result = [bounded_text(str(item), label, 120) for item in values]
+    if any(not item for item in result):
+        raise StudioError("%s must not be empty" % label)
+    if len(result) > 4:
+        raise StudioError("Each image can contain at most four approved copy phrases")
+    return result
 
 
 def parse_copy_overrides(cli_values: Optional[List[str]], brief_value: Any) -> Dict[str, List[str]]:
@@ -346,6 +400,7 @@ def build_prompt(
     scene: str,
     reference_roles: Sequence[str],
     has_references: bool,
+    shot_direction: str = "",
 ) -> str:
     selling_points = product.get("selling_points") or []
     exact_dimensions = product.get("dimensions") or ""
@@ -363,6 +418,8 @@ def build_prompt(
         prompt.append("Target audience: %s. Keep casting, styling, props, and visual hierarchy appropriate for them." % audience)
     if scene and image_type in {"hero", "lifestyle"}:
         prompt.append("Requested use scene: %s. Keep it realistic for the product and audience." % scene)
+    if shot_direction:
+        prompt.append("Shot-specific art direction: %s." % shot_direction)
     if reference_roles:
         ordered_roles = ", ".join("image %d=%s" % (index, role) for index, role in enumerate(reference_roles, 1))
         prompt.append(
@@ -453,16 +510,40 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         raise StudioError("Product name and category are required")
     if not reference_views:
         raise StudioError("At least one role-labeled product reference image is required for fidelity")
-    raw_types = getattr(args, "types", None) or brief.get("types")
-    if not raw_types:
-        raise StudioError("Choose the image types before creating a plan")
-    image_types = parse_types(str(raw_types))
+    raw_shots = brief.get("shots") if getattr(args, "types", None) is None else None
+    if raw_shots is not None:
+        if not isinstance(raw_shots, list) or not raw_shots:
+            raise StudioError("shots in the product brief must be a non-empty array")
+        if len(raw_shots) > MAX_JOBS:
+            raise StudioError("A plan can contain at most %d image jobs" % MAX_JOBS)
+        shot_specs = []
+        for position, raw_shot in enumerate(raw_shots, 1):
+            if not isinstance(raw_shot, dict):
+                raise StudioError("Each shots item must be an object")
+            image_type = str(raw_shot.get("type") or "").strip()
+            parse_types([image_type])
+            shot_specs.append(dict(raw_shot))
+        image_types = [str(shot["type"]).strip() for shot in shot_specs]
+    else:
+        raw_types = getattr(args, "types", None) or brief.get("types")
+        if not raw_types:
+            raise StudioError("Choose the image types or provide shots before creating a plan")
+        image_types = parse_types(raw_types)
+        shot_specs = [{"type": image_type} for image_type in image_types]
     raw_required_views = getattr(args, "required_view", None)
     if raw_required_views is None:
         raw_required_views = brief.get("required_views", [])
     if not isinstance(raw_required_views, list):
         raise StudioError("required_views in the product brief must be an array")
-    required_roles = required_reference_roles(product["category"], image_types, raw_required_views)
+    shot_required_roles = []
+    for shot in shot_specs:
+        values = shot.get("reference_roles", [])
+        if not isinstance(values, list):
+            raise StudioError("shots.reference_roles must be an array")
+        shot_required_roles.extend(str(value) for value in values)
+    required_roles = required_reference_roles(
+        product["category"], image_types, list(raw_required_views) + shot_required_roles
+    )
     supplied_roles = {view["role"] for view in reference_views}
     missing_roles = [role for role in required_roles if role not in supplied_roles]
     if missing_roles:
@@ -472,9 +553,9 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     if not 1 <= args.points_per_image <= 10000:
         raise StudioError("Points per image estimate must be between 1 and 10000")
     raw_size = args.size or brief.get("size")
-    if not raw_size:
-        raise StudioError("Choose the image ratio or dimensions before creating a plan")
-    size = validate_size(str(raw_size))
+    if not raw_size and any(not shot.get("size") for shot in shot_specs):
+        raise StudioError("Choose a default image size or set size on every shot")
+    size = validate_size(str(raw_size)) if raw_size else None
     platform = bounded_text(args.platform or brief.get("platform"), "Platform", 80)
     if not platform:
         raise StudioError("Choose the target platform and use before creating a plan")
@@ -497,42 +578,74 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     if quality not in {"low", "medium", "high"}:
         raise StudioError("Quality must be low, medium, or high")
     jobs = []
-    for position, image_type in enumerate(image_types, 1):
-        visible_copy = (
-            copy_overrides.get(image_type, visible_copy_for_type(image_type, product))
-            if text_mode == "render"
-            else []
-        )
+    used_job_ids = set()
+    for position, shot in enumerate(shot_specs, 1):
+        image_type = str(shot["type"]).strip()
+        shot_id = str(shot.get("id") or "img-%02d" % position).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", shot_id):
+            raise StudioError("Shot id must contain 1-48 letters, digits, underscores, or hyphens")
+        if shot_id in used_job_ids:
+            raise StudioError("Shot ids must be unique: %s" % shot_id)
+        used_job_ids.add(shot_id)
+        shot_text_mode = str(shot.get("text_mode") or text_mode)
+        if shot_text_mode not in {"reserve", "render", "none"}:
+            raise StudioError("Shot text_mode must be reserve, render, or none")
+        if "copy" in shot:
+            visible_copy = parse_copy_list(shot.get("copy"), "Shot visible copy")
+        elif shot_text_mode == "render":
+            visible_copy = copy_overrides.get(image_type, visible_copy_for_type(image_type, product))
+        else:
+            visible_copy = []
+        if visible_copy and shot_text_mode != "render":
+            raise StudioError("Shot visible copy requires text_mode render")
+        if image_type == "white_bg" and visible_copy:
+            raise StudioError("white_bg does not support overlay copy; use hero for a text-led main visual")
+        shot_size = validate_size(str(shot.get("size") or size))
+        shot_quality = str(shot.get("quality") or quality)
+        if shot_quality not in {"low", "medium", "high"}:
+            raise StudioError("Shot quality must be low, medium, or high")
+        shot_tone = bounded_text(str(shot.get("tone") or tone), "Shot visual tone", 240)
+        shot_audience = bounded_text(str(shot.get("audience") or audience), "Shot audience", 240)
+        shot_scene = bounded_text(str(shot.get("scene") or scene), "Shot scene", 300)
+        shot_direction = bounded_text(str(shot.get("direction") or ""), "Shot direction", 500)
+        requested_roles = [normalize_reference_role(str(value)) for value in shot.get("reference_roles", [])]
         jobs.append(
             {
-                "job_id": "img-%02d" % position,
+                "job_id": shot_id,
                 "index": position,
                 "type": image_type,
                 "label": TYPE_LABELS[image_type],
                 "copy": visible_copy,
+                "shot": {
+                    "direction": shot_direction,
+                    "scene": shot_scene,
+                    "audience": shot_audience,
+                    "reference_roles": requested_roles,
+                },
                 "request": {
                     "model": DEFAULT_MODEL,
                     "prompt": build_prompt(
                         image_type,
                         product,
                         platform,
-                        tone,
-                        text_mode,
+                        shot_tone,
+                        shot_text_mode,
                         language,
                         visible_copy,
-                        audience,
-                        scene,
+                        shot_audience,
+                        shot_scene,
                         [view["role"] for view in reference_views],
                         bool(references or reference_files),
+                        shot_direction,
                     ),
-                    "size": size,
-                    "quality": quality,
+                    "size": shot_size,
+                    "quality": shot_quality,
                     "image": references,
                 },
             }
         )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "generator_version": VERSION,
         "created_at": now_iso(),
         "provider": "算点边界",
@@ -584,6 +697,64 @@ def api_endpoint(base_url: str, path: str) -> str:
     return validate_base_url(base_url).rstrip("/") + "/" + path.lstrip("/")
 
 
+def decimal_credits(value: Any, field: str) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise StudioError("Billing response has an invalid %s" % field)
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise StudioError("Billing response has an invalid %s" % field) from exc
+    if not amount.is_finite() or amount < 0:
+        raise StudioError("Billing response has an invalid %s" % field)
+    return amount
+
+
+def format_credits(value: Decimal) -> str:
+    normalized = format(value.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def trusted_recharge_url(value: Any) -> str:
+    candidate = str(value or RECHARGE_URL).strip()
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return RECHARGE_URL
+    if parsed.scheme == "https" and (parsed.hostname or "").lower() == "token.qixuai.com":
+        return candidate
+    return RECHARGE_URL
+
+
+def billing_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    nested = payload.get("data")
+    return nested if isinstance(nested, dict) else payload
+
+
+def insufficient_credits_from_response(raw: bytes) -> Optional[InsufficientCreditsError]:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    fields = dict(payload)
+    if isinstance(payload.get("error"), dict):
+        fields.update(payload["error"])
+    code = str(fields.get("code") or fields.get("error") or "")
+    if code != "insufficient_credits":
+        return None
+    try:
+        return InsufficientCreditsError(
+            fields.get("balance", fields.get("current_balance")),
+            fields.get("required", fields.get("required_credits")),
+            fields.get("recharge_url") or payload.get("recharge_url") or RECHARGE_URL,
+        )
+    except StudioError:
+        return None
+
+
 def read_limited(response: Any, maximum: int) -> bytes:
     data = response.read(maximum + 1)
     if len(data) > maximum:
@@ -591,8 +762,19 @@ def read_limited(response: Any, maximum: int) -> bytes:
     return data
 
 
-def request_json(method: str, url: str, api_key: str, payload: Optional[Dict[str, Any]], timeout: int) -> Dict[str, Any]:
+def request_json(
+    method: str,
+    url: str,
+    api_key: str,
+    payload: Optional[Dict[str, Any]],
+    timeout: int,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     headers = {"Authorization": "Bearer " + api_key, "Accept": "application/json"}
+    for name, value in (extra_headers or {}).items():
+        if not re.fullmatch(r"[A-Za-z0-9-]+", name) or "\r" in value or "\n" in value:
+            raise StudioError("Invalid HTTP header")
+        headers[name] = value
     body = None
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -603,8 +785,13 @@ def request_json(method: str, url: str, api_key: str, payload: Optional[Dict[str
         with opener.open(request, timeout=timeout) as response:
             data = read_limited(response, MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as exc:
-        detail = exc.read(1200).decode("utf-8", errors="replace")
-        raise StudioError("API request failed with HTTP %d: %s" % (exc.code, detail[:1200])) from exc
+        raw_detail = exc.read(MAX_RESPONSE_BYTES + 1)
+        if exc.code == 402:
+            insufficient = insufficient_credits_from_response(raw_detail[:MAX_RESPONSE_BYTES])
+            if insufficient:
+                raise insufficient from exc
+        detail = raw_detail[:1200].decode("utf-8", errors="replace")
+        raise StudioError("API request failed with HTTP %d: %s" % (exc.code, detail)) from exc
     except urllib.error.URLError as exc:
         raise StudioError("API request failed: %s" % exc.reason) from exc
     try:
@@ -614,6 +801,18 @@ def request_json(method: str, url: str, api_key: str, payload: Optional[Dict[str
     if not isinstance(value, dict):
         raise StudioError("API returned a non-object JSON response")
     return value
+
+
+def fetch_qixuai_balance(api_key: str, timeout: int) -> Dict[str, Any]:
+    payload = request_json("GET", BALANCE_ENDPOINT, api_key, None, timeout)
+    fields = billing_fields(payload)
+    balance = decimal_credits(fields.get("balance", fields.get("available_credits")), "balance")
+    return {
+        "balance": balance,
+        "unit": str(fields.get("unit") or "credits"),
+        "recharge_url": trusted_recharge_url(fields.get("recharge_url") or payload.get("recharge_url")),
+        "updated_at": fields.get("updated_at") or payload.get("updated_at"),
+    }
 
 
 def verify_reference_descriptor(descriptor: Dict[str, Any]) -> Dict[str, Any]:
@@ -775,13 +974,19 @@ def extract_output_urls(response: Dict[str, Any]) -> List[str]:
     return result
 
 
-def require_api_key(environment_name: str) -> str:
+def require_api_key(
+    environment_name: str,
+    base_url: str = DEFAULT_BASE_URL,
+    required_scopes: Sequence[str] = ("images:write", "files:write"),
+) -> str:
     if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", environment_name):
         raise StudioError("Invalid API key environment variable name")
-    value = os.environ.get(environment_name, "").strip()
-    if not value:
-        raise StudioError("API key environment variable is not set: %s" % environment_name)
-    return value
+    try:
+        return qixuai_auth.require_api_key(
+            base_url, environment_name, required_scopes
+        )
+    except qixuai_auth.AuthError as exc:
+        raise StudioError(str(exc)) from exc
 
 
 def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
@@ -793,6 +998,7 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
                 "type": job["type"],
                 "label": job["label"],
                 "status": "not_submitted",
+                "idempotency_key": secrets.token_urlsafe(24),
                 "task_id": None,
                 "submitted_at": None,
                 "updated_at": None,
@@ -801,7 +1007,7 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 3,
+        "schema_version": 5,
         "generator_version": VERSION,
         "plan": str(plan_path),
         "plan_sha256": plan_fingerprint(plan),
@@ -821,6 +1027,21 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
             for descriptor in (plan.get("reference_files") or [])
         ],
         "created_at": now_iso(),
+        "billing": {
+            "status": "not_checked",
+            "balance": None,
+            "required": None,
+            "shortfall": None,
+            "unit": "credits",
+            "recharge_url": RECHARGE_URL,
+            "checked_at": None,
+            "quote_id": None,
+            "pricing_version": None,
+            "expires_at": None,
+            "sufficient": None,
+            "quoted_job_ids": [],
+            "request_sha256": None,
+        },
         "jobs": rows,
     }
 
@@ -830,6 +1051,14 @@ def load_or_create_manifest(path: Path, plan: Dict[str, Any], plan_path: Path) -
         manifest = load_json(path)
         if manifest.get("plan_sha256") != plan_fingerprint(plan):
             raise StudioError("Existing manifest belongs to a different plan")
+        changed = False
+        for row in manifest.get("jobs") or []:
+            if not row.get("idempotency_key"):
+                row["idempotency_key"] = secrets.token_urlsafe(24)
+                changed = True
+        if changed:
+            manifest["schema_version"] = 5
+            write_json_atomic(path, manifest)
         return manifest
     return initial_manifest(plan, plan_path)
 
@@ -921,26 +1150,179 @@ def upload_local_references(
     return combined
 
 
+def parse_utc_timestamp(value: Any, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise StudioError("%s is not a valid timestamp" % label) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def job_requests(
+    plan: Dict[str, Any], job_ids: Sequence[str], reference_urls: Sequence[str]
+) -> List[Dict[str, Any]]:
+    selected = set(job_ids)
+    result = []
+    for job in plan.get("jobs") or []:
+        if job.get("job_id") not in selected:
+            continue
+        payload = dict(job.get("request") or {})
+        payload["image"] = list(reference_urls)
+        result.append({"job_id": str(job["job_id"]), "request": payload})
+    if len(result) != len(selected):
+        raise StudioError("Manifest and plan job IDs do not match")
+    return result
+
+
+def request_set_fingerprint(entries: Sequence[Dict[str, Any]]) -> str:
+    payload = json.dumps(list(entries), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def quoted_reference_urls(manifest: Dict[str, Any], plan: Dict[str, Any]) -> List[str]:
+    direct = [validate_reference_url(str(value)) for value in (plan.get("reference_images") or [])]
+    uploaded = []
+    rows = manifest.get("reference_uploads") or []
+    if len(rows) != len(plan.get("reference_files") or []):
+        raise StudioError("Manifest reference uploads do not match the generation plan; run quote again")
+    for row in rows:
+        if row.get("status") != "uploaded" or upload_url_expired(row):
+            raise StudioError("A quoted reference upload is missing or expired; run quote again and reconfirm")
+        url = extract_upload_url({"url": row.get("url")})
+        if not url:
+            raise StudioError("Manifest contains an invalid uploaded reference URL; run quote again")
+        uploaded.append(url)
+    combined = direct + uploaded
+    if not combined:
+        raise StudioError("At least one product reference image is required")
+    if len(combined) > MAX_REFERENCE_IMAGES:
+        raise StudioError("Qx-Image accepts at most %d reference images" % MAX_REFERENCE_IMAGES)
+    return combined
+
+
+def command_quote(args: argparse.Namespace) -> None:
+    plan_path = Path(args.plan).resolve()
+    plan = load_json(plan_path)
+    jobs = plan.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise StudioError("Generation plan contains no jobs")
+    if (plan.get("reference_coverage") or {}).get("status") != "complete":
+        raise StudioError("Exact quote requires a complete role-labeled reference coverage check; recreate the plan")
+    base_url = str(plan.get("base_url") or DEFAULT_BASE_URL)
+    if not qixuai_auth.is_qixuai_url(base_url):
+        raise StudioError("Exact image quotes are currently available only for token.qixuai.com")
+    output_dir = Path(args.output_dir).resolve()
+    manifest_path = output_dir / "generation_manifest.json"
+    preview = {
+        "mode": "dry-run" if not args.execute else "execute",
+        "endpoint": QUOTE_ENDPOINT,
+        "images": len(jobs),
+        "local_reference_uploads": len(plan.get("reference_files") or []),
+        "remote_reference_urls": len(plan.get("reference_images") or []),
+        "uploads_product_references": bool(plan.get("reference_files")),
+        "sends_prompts_for_quote": True,
+        "charges_credits": False,
+        "manifest": str(manifest_path),
+    }
+    if not args.execute:
+        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        return
+    if not args.confirm_remote_quote:
+        raise StudioError(
+            "Remote quote requires --confirm-remote-quote after the user approves uploading references and sending prompts"
+        )
+    scopes = ["billing:read"]
+    if plan.get("reference_files"):
+        scopes.append("files:write")
+    api_key = require_api_key(args.api_key_env, base_url, scopes)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = load_or_create_manifest(manifest_path, plan, plan_path)
+    pending_ids = [
+        str(row["job_id"])
+        for row in manifest.get("jobs") or []
+        if not row.get("task_id") and row.get("status") in {"not_submitted", "submit_unknown"}
+    ]
+    if not pending_ids:
+        print(json.dumps({"status": "ok", "manifest": str(manifest_path), "message": "没有待报价任务"}, ensure_ascii=False))
+        return
+    reference_urls = upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
+    entries = job_requests(plan, pending_ids, reference_urls)
+    quote_payload = {
+        "model": str(plan.get("model") or DEFAULT_MODEL),
+        "jobs": [entry["request"] for entry in entries],
+    }
+    response = request_json("POST", QUOTE_ENDPOINT, api_key, quote_payload, args.timeout)
+    fields = billing_fields(response)
+    quote_id = str(fields.get("quote_id") or "").strip()
+    pricing_version = str(fields.get("pricing_version") or "").strip()
+    expires_at = str(fields.get("expires_at") or "").strip()
+    total = decimal_credits(fields.get("total_credits"), "total_credits")
+    balance = decimal_credits(fields.get("balance"), "balance")
+    sufficient = fields.get("sufficient")
+    if not quote_id or not pricing_version or not expires_at or not isinstance(sufficient, bool):
+        raise StudioError("Quote response is missing quote_id, pricing_version, expires_at, or sufficient")
+    if parse_utc_timestamp(expires_at, "Quote expires_at") <= datetime.now(timezone.utc):
+        raise StudioError("Quote response was already expired")
+    shortfall = max(Decimal("0"), total - balance)
+    manifest["reference_images"] = reference_urls
+    manifest["billing"] = {
+        "status": "quoted" if sufficient else "waiting_for_recharge",
+        "balance": format_credits(balance),
+        "required": format_credits(total),
+        "shortfall": format_credits(shortfall),
+        "unit": str(fields.get("unit") or "credits"),
+        "recharge_url": trusted_recharge_url(fields.get("recharge_url") or response.get("recharge_url")),
+        "checked_at": now_iso(),
+        "quote_id": quote_id,
+        "pricing_version": pricing_version,
+        "expires_at": expires_at,
+        "sufficient": sufficient,
+        "quoted_job_ids": pending_ids,
+        "request_sha256": request_set_fingerprint(entries),
+    }
+    write_json_atomic(manifest_path, manifest)
+    result = {
+        "status": "quoted" if sufficient else "waiting_for_recharge",
+        "manifest": str(manifest_path),
+        "images": len(pending_ids),
+        "exact_credits": format_credits(total),
+        "balance": format_credits(balance),
+        "sufficient": sufficient,
+        "expires_at": expires_at,
+        "pricing_version": pricing_version,
+        "recharge_url": manifest["billing"]["recharge_url"],
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not sufficient:
+        raise InsufficientCreditsError(balance, total, manifest["billing"]["recharge_url"])
+
+
 def command_generate(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan).resolve()
     plan = load_json(plan_path)
     jobs = plan.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         raise StudioError("Generation plan contains no jobs")
-    estimate = int(plan.get("estimated_points") or len(jobs) * int(plan.get("points_per_image_estimate") or 10))
     output_dir = Path(args.output_dir).resolve()
     manifest_path = output_dir / "generation_manifest.json"
+    existing_billing: Dict[str, Any] = {}
+    if manifest_path.exists():
+        existing_manifest = load_json(manifest_path)
+        if existing_manifest.get("plan_sha256") == plan_fingerprint(plan):
+            existing_billing = existing_manifest.get("billing") or {}
     preview = {
         "mode": "dry-run" if not args.execute else "execute",
         "endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true"),
-        "upload_endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/uploads"),
         "model": plan.get("model"),
         "images": len(jobs),
-        "local_reference_uploads": len(plan.get("reference_files") or []),
-        "remote_reference_urls": len(plan.get("reference_images") or []),
         "reference_roles": (plan.get("reference_coverage") or {}).get("supplied_roles", []),
         "fidelity_gate": (plan.get("reference_coverage") or {}).get("status", "unknown"),
-        "estimated_points": estimate,
+        "quote_status": existing_billing.get("status") or "quote_required",
+        "exact_credits": existing_billing.get("required"),
+        "quote_expires_at": existing_billing.get("expires_at"),
+        "charges_credits": bool(args.execute),
         "manifest": str(manifest_path),
     }
     if not args.execute:
@@ -949,39 +1331,80 @@ def command_generate(args: argparse.Namespace) -> None:
     if preview["fidelity_gate"] != "complete":
         raise StudioError("Live generation requires a complete role-labeled reference coverage check; recreate the plan")
     if not args.confirm_live_run:
-        raise StudioError("Live generation requires --confirm-live-run after reviewing the endpoint and estimated points")
-    if args.max_points is None or args.max_points < estimate:
-        raise StudioError("Set --max-points to at least the current estimate (%d)" % estimate)
-    api_key = require_api_key(args.api_key_env)
-    output_dir.mkdir(parents=True, exist_ok=True)
+        raise StudioError("Live generation requires --confirm-live-run after reviewing the exact quote")
+    if not manifest_path.exists():
+        raise StudioError("No exact quote exists. Run quote --execute --confirm-remote-quote first")
+    base_url = str(plan.get("base_url") or DEFAULT_BASE_URL)
+    api_key = require_api_key(args.api_key_env, base_url, ["images:write"])
     manifest = load_or_create_manifest(manifest_path, plan, plan_path)
     manifest_rows = {row["job_id"]: row for row in manifest["jobs"]}
-    endpoint = api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true")
-    has_pending_jobs = any(
-        not row.get("task_id") and row.get("status") == "not_submitted" for row in manifest["jobs"]
-    )
-    reference_urls = (
-        upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
-        if has_pending_jobs
-        else [validate_reference_url(str(value)) for value in (manifest.get("reference_images") or [])]
-    )
+    endpoint = api_endpoint(base_url, "images/generations?async=true")
+    pending_rows = [
+        row for row in manifest["jobs"]
+        if not row.get("task_id") and row.get("status") in {"not_submitted", "submit_unknown"}
+    ]
+    if not pending_rows:
+        print(json.dumps({"status": "ok", "manifest": str(manifest_path), "submitted": 0, "jobs": len(jobs)}, ensure_ascii=False))
+        return
+    billing = manifest.get("billing") or {}
+    if billing.get("status") == "waiting_for_recharge" or billing.get("sufficient") is False:
+        raise InsufficientCreditsError(
+            billing.get("balance"), billing.get("required"), billing.get("recharge_url") or RECHARGE_URL
+        )
+    if billing.get("status") != "quoted" or not billing.get("quote_id"):
+        raise StudioError("No usable exact quote exists. Run quote --execute --confirm-remote-quote first")
+    if parse_utc_timestamp(billing.get("expires_at"), "Quote expires_at") <= datetime.now(timezone.utc):
+        raise StudioError("The exact quote expired. Run quote again, review the new price, then reconfirm generation")
+    quoted_total = decimal_credits(billing.get("required"), "quoted total")
+    if args.max_points is None or decimal_credits(args.max_points, "max_points") < quoted_total:
+        raise StudioError("Set --max-points to at least the exact quote (%s)" % format_credits(quoted_total))
+    reference_urls = quoted_reference_urls(manifest, plan)
+    quoted_ids = [str(value) for value in (billing.get("quoted_job_ids") or [])]
+    pending_ids = [str(row["job_id"]) for row in pending_rows]
+    if not set(pending_ids).issubset(set(quoted_ids)):
+        raise StudioError("The exact quote does not cover every pending job; run quote again")
+    quoted_entries = job_requests(plan, quoted_ids, reference_urls)
+    if billing.get("request_sha256") != request_set_fingerprint(quoted_entries):
+        raise StudioError("The quoted requests or reference URLs changed; run quote again and reconfirm")
     submitted = 0
     for job in jobs:
         row = manifest_rows.get(job["job_id"])
         if row is None:
             raise StudioError("Manifest is missing job %s" % job["job_id"])
-        if row.get("task_id") or row.get("status") != "not_submitted":
+        if row.get("task_id") or row.get("status") not in {"not_submitted", "submit_unknown"}:
             continue
         payload = dict(job["request"])
         payload["image"] = reference_urls
+        payload["quote_id"] = str(billing["quote_id"])
+        idempotency_key = str(row.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            idempotency_key = secrets.token_urlsafe(24)
+            row["idempotency_key"] = idempotency_key
+            write_json_atomic(manifest_path, manifest)
         try:
-            response = request_json("POST", endpoint, api_key, payload, args.timeout)
+            response = request_json(
+                "POST", endpoint, api_key, payload, args.timeout,
+                {"Idempotency-Key": idempotency_key},
+            )
+        except InsufficientCreditsError as exc:
+            manifest["billing"] = {
+                "status": "waiting_for_recharge",
+                "balance": format_credits(exc.balance),
+                "required": format_credits(exc.required),
+                "shortfall": format_credits(exc.shortfall),
+                "unit": "credits",
+                "recharge_url": exc.recharge_url,
+                "checked_at": now_iso(),
+                "source": "generation_http_402",
+            }
+            write_json_atomic(manifest_path, manifest)
+            raise
         except StudioError:
             row["status"] = "submit_unknown"
             row["updated_at"] = now_iso()
             write_json_atomic(manifest_path, manifest)
             raise StudioError(
-                "Submission outcome is unknown. Manifest was saved; do not resubmit this job until usage is checked."
+                "Submission outcome is unknown. The idempotency key was saved; retrying this same plan will not double-charge."
             )
         task_id = extract_task_id(response)
         row["submitted_at"] = now_iso()
@@ -1100,7 +1523,8 @@ def command_collect(args: argparse.Namespace) -> None:
         raise StudioError("Remote task collection requires --confirm-live-run")
     manifest_path = Path(args.manifest).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else manifest_path.parent
-    api_key = require_api_key(args.api_key_env)
+    manifest = load_json(manifest_path)
+    api_key = require_api_key(args.api_key_env, str(manifest.get("base_url") or DEFAULT_BASE_URL))
     result = collect_manifest(
         manifest_path, output_dir, api_key, args.timeout, args.poll_interval, args.wait_timeout, args.wait
     )
@@ -1148,8 +1572,10 @@ def inspect_with_pillow(path: Path, white_background: bool) -> Dict[str, Any]:
 def command_audit(args: argparse.Namespace) -> None:
     plan = load_json(Path(args.plan))
     manifest = load_json(Path(args.manifest))
-    expected_by_type = {job["type"]: expected_ratio(str(job["request"]["size"])) for job in plan.get("jobs") or []}
-    copy_by_type = {job["type"]: job.get("copy") or [] for job in plan.get("jobs") or []}
+    expected_by_job = {
+        job["job_id"]: expected_ratio(str(job["request"]["size"])) for job in plan.get("jobs") or []
+    }
+    copy_by_job = {job["job_id"]: job.get("copy") or [] for job in plan.get("jobs") or []}
     rows = []
     for job in manifest.get("jobs") or []:
         for value in job.get("files") or []:
@@ -1157,10 +1583,10 @@ def command_audit(args: argparse.Namespace) -> None:
             inspected = inspect_with_pillow(path, job.get("type") == "white_bg")
             inspected["job_id"] = job.get("job_id")
             inspected["type"] = job.get("type")
-            inspected["expected_copy"] = copy_by_type.get(job.get("type"), [])
+            inspected["expected_copy"] = copy_by_job.get(job.get("job_id"), [])
             if "width" in inspected and "height" in inspected:
                 actual = inspected["width"] / inspected["height"]
-                expected = expected_by_type.get(job.get("type"))
+                expected = expected_by_job.get(job.get("job_id"))
                 inspected["aspect_ok"] = expected is None or abs(actual - expected) <= 0.025
                 inspected["minimum_size_ok"] = min(inspected["width"], inspected["height"]) >= args.min_dimension
                 if job.get("type") == "white_bg":
@@ -1200,13 +1626,34 @@ def command_doctor(args: argparse.Namespace) -> None:
     except ImportError:
         pillow = False
     key_name_ok = bool(re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", args.api_key_env))
+    credential_error = None
+    try:
+        credential_ready = bool(
+            qixuai_auth.resolve_api_key(
+                DEFAULT_BASE_URL,
+                args.api_key_env,
+                ("images:write", "files:write", "billing:read"),
+            )
+        ) if key_name_ok else False
+    except qixuai_auth.AuthError as exc:
+        credential_ready = False
+        credential_error = str(exc)
     report = {
         "python": sys.version.split()[0],
         "pillow": pillow,
         "api_key_env": args.api_key_env,
-        "api_key_configured": key_name_ok and bool(os.environ.get(args.api_key_env, "").strip()),
+        "api_key_configured": credential_ready,
+        "credential_source": (
+            "environment" if key_name_ok and bool(os.environ.get(args.api_key_env, "").strip())
+            else "qixuai_device" if credential_ready else None
+        ),
+        "credential_error": credential_error,
+        "required_device_scopes": ["images:write", "files:write", "billing:read"],
+        "balance_endpoint": BALANCE_ENDPOINT,
+        "quote_endpoint": QUOTE_ENDPOINT,
+        "recharge_url": RECHARGE_URL,
         "ready_for_plan": True,
-        "ready_for_generate": key_name_ok and bool(os.environ.get(args.api_key_env, "").strip()),
+        "ready_for_generate": credential_ready,
         "ready_for_audit": pillow,
         "max_reference_images": MAX_REFERENCE_IMAGES,
         "reference_roles": list(REFERENCE_ROLE_ORDER),
@@ -1255,6 +1702,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--base-url", default=DEFAULT_BASE_URL)
     plan.add_argument("--output", required=True)
     plan.set_defaults(func=command_plan)
+
+    quote = subparsers.add_parser("quote", help="Upload approved references and request an exact no-charge quote")
+    quote.add_argument("--plan", required=True)
+    quote.add_argument("--output-dir", required=True)
+    quote.add_argument("--execute", action="store_true")
+    quote.add_argument("--confirm-remote-quote", action="store_true")
+    quote.add_argument("--api-key-env", default="QIXUAI_API_KEY")
+    quote.add_argument("--timeout", type=int, default=30)
+    quote.set_defaults(func=command_quote)
 
     generate = subparsers.add_parser("generate", help="Preview or submit asynchronous Qx-Image jobs")
     generate.add_argument("--plan", required=True)

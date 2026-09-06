@@ -1,22 +1,54 @@
 # 算点边界 Qx-Image 接口
 
-根据 2026-09-04 的控制台和公开 API 文档：
+根据 2026-09-06 已部署接口和 V3 文档：
 
 - Base URL：`https://token.qixuai.com/v1`
 - 模型：`Qx-Image`
-- 上传：`POST /images/uploads`，`multipart/form-data` 的文件字段名为 `file`
+- 上传：`POST /images/uploads`，`multipart/form-data`，文件字段名 `file`
+- 报价：`POST https://token.qixuai.com/api/billing/quotes/image-generation`
 - 创建：`POST /images/generations?async=true`
 - 查询：`GET /tasks/{task-id}`
-- `prompt` 必填，最多 5000 字符
-- `size` 支持比例或自定义宽高；控制台提供 `1:1`、`16:9`、`9:16`、`3:2`、`2:3`、`4:3`、`3:4`
-- `quality` 支持 `low`、`medium`、`high`
-- `image` 可选，最多 16 个已上传图片 URL
-- 上传支持 PNG、JPG、JPEG、WEBP、GIF，单文件最大 10 MB；成功响应顶层 `url` 是后续生图请求使用的 HTTPS 地址
-- 上传响应包含 `expires_in`，文件保留 24 小时，必须在有效期内提交生成任务
-- 任务状态可能为 `pending`、`running`、`succeeded` 或 `error`
+- 余额：`GET https://token.qixuai.com/api/billing/balance`
+- 充值：<https://token.qixuai.com/console/recharge?intent=buy>
 
-控制台当时显示固定价格 10 积分/张，实际价格可能调整。每次执行前以控制台为准，并通过 `--points-per-image` 更新计划估算。
+`prompt` 必填且最多 5000 字符。`size` 支持比例或自定义宽高；`quality` 支持 `low`、`medium`、`high`；`image` 最多包含 16 个已上传的 HTTPS URL。上传支持 PNG、JPG、JPEG、WEBP、GIF，单文件最大 10 MB，响应中的 URL 通常保留 24 小时。
 
-脚本在计划阶段记录本地文件的角色与 SHA-256，上传前重新核对，避免计划审核后文件被替换。成功上传的 URL、`expires_in`、到期时间和任务 ID 都立即写入 `generation_manifest.json`。有待提交任务且 URL 已过期时重新上传；所有任务已提交时不为查询结果重复上传。
+## 精确报价
 
-上传或任务 POST 超时、响应缺少 URL/任务 ID 时分别标记 `upload_unknown` 或 `submit_unknown` 并停止，不自动重试。先检查上传记录或用量明细，再决定是否用已知 URL 新建计划，避免重复上传或扣费。
+请求使用完整任务结构：
+
+```json
+{
+  "model": "Qx-Image",
+  "jobs": [
+    {
+      "model": "Qx-Image",
+      "prompt": "完整提示词",
+      "size": "1:1",
+      "quality": "medium",
+      "image": ["https://example.com/reference.jpg"]
+    }
+  ]
+}
+```
+
+成功响应包含 `quote_id`、`total_credits`、`balance`、`sufficient`、`expires_at` 和 `pricing_version`。报价有效期 5 分钟，不冻结、不扣除积分。匿名请求返回 HTTP 401；错误还可能为 400、403、409。
+
+## 正式生成
+
+生成请求必须与报价中的模型、提示词、尺寸、质量和参考图一致，并增加 `quote_id`：
+
+```json
+{
+  "model": "Qx-Image",
+  "prompt": "完整提示词",
+  "size": "1:1",
+  "quality": "medium",
+  "image": ["https://example.com/reference.jpg"],
+  "quote_id": "服务端报价标识"
+}
+```
+
+同时发送 HTTP `Idempotency-Key`。同一任务重试必须复用原键。服务端可能返回 HTTP 402 `insufficient_credits`、409 参数或价格冲突、410 报价过期；这些情况都不能自动改价并继续。
+
+脚本会记录本地文件的角色与 SHA-256，上传前重新核对；成功上传 URL、有效期、报价请求指纹、价格版本、幂等键和任务 ID 都会立即写入 `generation_manifest.json`。报价后参考 URL 过期或计划发生变化时必须重新报价。

@@ -52,6 +52,41 @@ class PlanTests(unittest.TestCase):
         self.assertIn("Preserve the product exactly", prompt)
         self.assertIn("pure white #FFFFFF", prompt)
 
+    def test_repeated_types_create_distinct_shots(self):
+        plan = studio.create_plan(plan_args(types="hero,feature,feature"))
+        self.assertEqual(["hero", "feature", "feature"], [job["type"] for job in plan["jobs"]])
+        self.assertEqual(["img-01", "img-02", "img-03"], [job["job_id"] for job in plan["jobs"]])
+
+    def test_brief_shots_support_per_image_direction_and_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            brief_path = Path(directory) / "brief.json"
+            studio.write_json_atomic(
+                brief_path,
+                {
+                    "shots": [
+                        {
+                            "id": "feature-heat",
+                            "type": "feature",
+                            "direction": "杯身居左，右侧展示保温卖点",
+                            "copy": ["长效锁温"],
+                            "reference_roles": ["front"],
+                        },
+                        {
+                            "id": "feature-lid",
+                            "type": "feature",
+                            "direction": "突出旋盖与单手开合动作",
+                            "copy": ["单手开合"],
+                            "reference_roles": ["front"],
+                        },
+                    ]
+                },
+            )
+            plan = studio.create_plan(plan_args(brief=str(brief_path), types=None))
+        self.assertEqual(["feature-heat", "feature-lid"], [job["job_id"] for job in plan["jobs"]])
+        self.assertEqual(["长效锁温"], plan["jobs"][0]["copy"])
+        self.assertIn("杯身居左", plan["jobs"][0]["request"]["prompt"])
+        self.assertEqual(1, len(plan["jobs"][0]["request"]["image"]))
+
     def test_reserve_text_mode_avoids_rendered_copy(self):
         plan = studio.create_plan(plan_args(types="hero", text_mode="reserve"))
         prompt = plan["jobs"][0]["request"]["prompt"]
@@ -293,6 +328,28 @@ class ResponseTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_quote_requires_separate_confirmation_before_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "product.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff" + b"test-image")
+            plan_path = root / "plan.json"
+            studio.write_json_atomic(
+                plan_path,
+                studio.create_plan(
+                    plan_args(types="white_bg", reference_url=[], reference_file=["front=" + str(image_path)])
+                ),
+            )
+            output_dir = root / "output"
+            args = argparse.Namespace(
+                plan=str(plan_path), output_dir=str(output_dir), execute=True,
+                confirm_remote_quote=False, api_key_env="QIXUAI_API_KEY", timeout=30,
+            )
+            with self.assertRaises(studio.StudioError) as caught:
+                studio.command_quote(args)
+            self.assertIn("--confirm-remote-quote", str(caught.exception))
+            self.assertFalse(output_dir.exists())
+
     def test_live_generation_rejects_plan_without_fidelity_gate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -308,7 +365,7 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaises(studio.StudioError):
                 studio.command_generate(args)
 
-    def test_generate_uploads_local_reference_once_and_uses_returned_url(self):
+    def test_quote_uploads_once_then_generate_uses_quote_and_idempotency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             image_path = root / "product.jpg"
@@ -320,7 +377,8 @@ class WorkflowTests(unittest.TestCase):
             output_dir = root / "output"
             studio.write_json_atomic(plan_path, plan)
             upload_calls = []
-            generation_payloads = []
+            quote_payloads = []
+            generation_calls = []
             original_upload = studio.request_file_upload
             original_request = studio.request_json
             original_key = os.environ.get("QIXUAI_API_KEY")
@@ -331,23 +389,36 @@ class WorkflowTests(unittest.TestCase):
                     upload_calls.append(descriptor["path"])
                     return {"url": "https://cdn.example.com/uploaded.jpg", "expires_in": 3600}
 
-                def fake_request(method, url, api_key, payload, timeout):
-                    generation_payloads.append(payload)
+                def fake_request(method, url, api_key, payload, timeout, extra_headers=None):
+                    if url == studio.QUOTE_ENDPOINT:
+                        quote_payloads.append(payload)
+                        return {
+                            "data": {
+                                "quote_id": "quote-1",
+                                "total_credits": 10,
+                                "balance": 100,
+                                "sufficient": True,
+                                "expires_at": "2999-01-01T00:00:00+00:00",
+                                "pricing_version": "price-v1",
+                            }
+                        }
+                    generation_calls.append((payload, extra_headers))
                     return {"task_id": "task-1"}
 
                 studio.request_file_upload = fake_upload
                 studio.request_json = fake_request
-                args = argparse.Namespace(
+                quote_args = argparse.Namespace(
+                    plan=str(plan_path), output_dir=str(output_dir), execute=True,
+                    confirm_remote_quote=True, api_key_env="QIXUAI_API_KEY", timeout=30,
+                )
+                generate_args = argparse.Namespace(
                     plan=str(plan_path), output_dir=str(output_dir), max_points=10,
                     execute=True, wait=False, poll_interval=5, wait_timeout=900,
                     api_key_env="QIXUAI_API_KEY", confirm_live_run=True, timeout=30,
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
-                    studio.command_generate(args)
-                    saved_manifest = studio.load_json(output_dir / "generation_manifest.json")
-                    saved_manifest["reference_uploads"][0]["expires_at"] = "2000-01-01T00:00:00+00:00"
-                    studio.write_json_atomic(output_dir / "generation_manifest.json", saved_manifest)
-                    studio.command_generate(args)
+                    studio.command_quote(quote_args)
+                    studio.command_generate(generate_args)
             finally:
                 studio.request_file_upload = original_upload
                 studio.request_json = original_request
@@ -357,8 +428,11 @@ class WorkflowTests(unittest.TestCase):
                     os.environ["QIXUAI_API_KEY"] = original_key
             manifest = studio.load_json(output_dir / "generation_manifest.json")
             self.assertEqual(1, len(upload_calls))
-            self.assertEqual(1, len(generation_payloads))
-            self.assertEqual(["https://cdn.example.com/uploaded.jpg"], generation_payloads[0]["image"])
+            self.assertEqual(1, len(quote_payloads))
+            self.assertEqual(1, len(generation_calls))
+            self.assertEqual(["https://cdn.example.com/uploaded.jpg"], quote_payloads[0]["jobs"][0]["image"])
+            self.assertEqual("quote-1", generation_calls[0][0]["quote_id"])
+            self.assertEqual(manifest["jobs"][0]["idempotency_key"], generation_calls[0][1]["Idempotency-Key"])
             self.assertEqual("uploaded", manifest["reference_uploads"][0]["status"])
             self.assertEqual(3600, manifest["reference_uploads"][0]["expires_in"])
 
@@ -453,6 +527,15 @@ class WorkflowTests(unittest.TestCase):
             manifest = studio.initial_manifest(plan, plan_path.resolve())
             manifest["jobs"][0]["task_id"] = "existing-task"
             manifest["jobs"][0]["status"] = "submitted"
+            quoted_ids = [job["job_id"] for job in plan["jobs"]]
+            entries = studio.job_requests(plan, quoted_ids, plan["reference_images"])
+            manifest["billing"] = {
+                "status": "quoted", "balance": "100", "required": "20", "shortfall": "0",
+                "unit": "credits", "recharge_url": studio.RECHARGE_URL,
+                "checked_at": studio.now_iso(), "quote_id": "quote-1", "pricing_version": "v1",
+                "expires_at": "2999-01-01T00:00:00+00:00", "sufficient": True,
+                "quoted_job_ids": quoted_ids, "request_sha256": studio.request_set_fingerprint(entries),
+            }
             studio.write_json_atomic(manifest_path, manifest)
             calls = []
             original_request = studio.request_json
@@ -460,8 +543,8 @@ class WorkflowTests(unittest.TestCase):
             try:
                 os.environ["QIXUAI_API_KEY"] = "test-key"
 
-                def fake_request(method, url, api_key, payload, timeout):
-                    calls.append(payload)
+                def fake_request(method, url, api_key, payload, timeout, extra_headers=None):
+                    calls.append((payload, extra_headers))
                     return {"task_id": "new-task"}
 
                 studio.request_json = fake_request
@@ -480,6 +563,8 @@ class WorkflowTests(unittest.TestCase):
                     os.environ["QIXUAI_API_KEY"] = original_key
             updated = studio.load_json(manifest_path)
             self.assertEqual(1, len(calls))
+            self.assertEqual("quote-1", calls[0][0]["quote_id"])
+            self.assertEqual(updated["jobs"][1]["idempotency_key"], calls[0][1]["Idempotency-Key"])
             self.assertEqual("existing-task", updated["jobs"][0]["task_id"])
             self.assertEqual("new-task", updated["jobs"][1]["task_id"])
 
