@@ -4,4 +4,4 @@ interface:
   icon_small: "./assets/icon.svg"
   icon_large: "./assets/icon.svg"
   brand_color: "#E5484D"
-  default_prompt: "使用 $ecommerce-product-image-cn 检查我的商品参考图，逐张确认构图和中文文案，精确报价后生成高一致性的电商套图。"
+  default_prompt: "使用 $ecommerce-product-image-cn 检查我的商品参考图，逐张确认构图和中文文案，确认方案后直接生成高一致性的电商套图。"

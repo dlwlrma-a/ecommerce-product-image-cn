@@ -1,6 +1,6 @@
 # QixuAI 浏览器设备授权
 
-使用 QixuAI 时不要要求用户复制、粘贴或发送 API Key。设备授权必须与套图方案确认、上传报价确认和付费生成确认分开。
+使用 QixuAI 时不要要求用户复制、粘贴或发送 API Key。用户确认套图方案后，如本机尚未授权，完成一次设备登录即可继续直接生成，不增加报价步骤。
 
 ## 两阶段授权
 
@@ -33,7 +33,7 @@ python scripts/qixuai_auth.py status --check
 - 环境变量优先级最高，方便显式使用测试 Key。
 - 设备凭据只会发送到主机精确等于 `token.qixuai.com` 的 HTTPS URL。
 
-本 Skill 需要 `images:write files:write billing:read`；默认授权器还会申请供其他 QixuAI Skill 共用的 `models:read chat:write`。旧令牌缺少 `billing:read` 时重新授权。
+本 Skill 生成需要 `images:write`，上传本地参考图需要 `files:write`；默认授权器还会申请供其他 QixuAI Skill 共用的 `models:read chat:write billing:read`。
 
 仅删除本机凭据：
 

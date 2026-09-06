@@ -25,11 +25,9 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
 
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
-BALANCE_ENDPOINT = "https://token.qixuai.com/api/billing/balance"
-QUOTE_ENDPOINT = "https://token.qixuai.com/api/billing/quotes/image-generation"
 RECHARGE_URL = "https://token.qixuai.com/console/recharge?intent=buy"
 MAX_REFERENCE_IMAGES = 16
 MAX_JOBS = 16
@@ -123,7 +121,7 @@ class InsufficientCreditsError(StudioError):
         self.shortfall = max(Decimal("0"), self.required - self.balance)
         self.recharge_url = trusted_recharge_url(recharge_url)
         super().__init__(
-            "积分余额不足：当前 %s 积分，本次待提交任务预计需要 %s 积分，还差 %s 积分。"
+            "积分余额不足：当前 %s 积分，本次请求需要 %s 积分，还差 %s 积分。"
             "任务已暂停，请充值后回复“继续”：%s"
             % (
                 format_credits(self.balance),
@@ -727,11 +725,6 @@ def trusted_recharge_url(value: Any) -> str:
     return RECHARGE_URL
 
 
-def billing_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
-    nested = payload.get("data")
-    return nested if isinstance(nested, dict) else payload
-
-
 def insufficient_credits_from_response(raw: bytes) -> Optional[InsufficientCreditsError]:
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -739,17 +732,21 @@ def insufficient_credits_from_response(raw: bytes) -> Optional[InsufficientCredi
         return None
     if not isinstance(payload, dict):
         return None
-    fields = dict(payload)
-    if isinstance(payload.get("error"), dict):
-        fields.update(payload["error"])
-    code = str(fields.get("code") or fields.get("error") or "")
-    if code != "insufficient_credits":
+    codes = [
+        str(value) for value in nested_values(payload, {"code", "error"})
+        if isinstance(value, str)
+    ]
+    if "insufficient_credits" not in codes:
         return None
+
+    def first_value(keys: Iterable[str]) -> Any:
+        return next(nested_values(payload, keys), None)
+
     try:
         return InsufficientCreditsError(
-            fields.get("balance", fields.get("current_balance")),
-            fields.get("required", fields.get("required_credits")),
-            fields.get("recharge_url") or payload.get("recharge_url") or RECHARGE_URL,
+            first_value({"balance", "current_balance", "available_credits"}),
+            first_value({"required", "required_credits"}),
+            first_value({"recharge_url"}) or RECHARGE_URL,
         )
     except StudioError:
         return None
@@ -801,18 +798,6 @@ def request_json(
     if not isinstance(value, dict):
         raise StudioError("API returned a non-object JSON response")
     return value
-
-
-def fetch_qixuai_balance(api_key: str, timeout: int) -> Dict[str, Any]:
-    payload = request_json("GET", BALANCE_ENDPOINT, api_key, None, timeout)
-    fields = billing_fields(payload)
-    balance = decimal_credits(fields.get("balance", fields.get("available_credits")), "balance")
-    return {
-        "balance": balance,
-        "unit": str(fields.get("unit") or "credits"),
-        "recharge_url": trusted_recharge_url(fields.get("recharge_url") or payload.get("recharge_url")),
-        "updated_at": fields.get("updated_at") or payload.get("updated_at"),
-    }
 
 
 def verify_reference_descriptor(descriptor: Dict[str, Any]) -> Dict[str, Any]:
@@ -1035,12 +1020,6 @@ def initial_manifest(plan: Dict[str, Any], plan_path: Path) -> Dict[str, Any]:
             "unit": "credits",
             "recharge_url": RECHARGE_URL,
             "checked_at": None,
-            "quote_id": None,
-            "pricing_version": None,
-            "expires_at": None,
-            "sufficient": None,
-            "quoted_job_ids": [],
-            "request_sha256": None,
         },
         "jobs": rows,
     }
@@ -1150,155 +1129,6 @@ def upload_local_references(
     return combined
 
 
-def parse_utc_timestamp(value: Any, label: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise StudioError("%s is not a valid timestamp" % label) from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def job_requests(
-    plan: Dict[str, Any], job_ids: Sequence[str], reference_urls: Sequence[str]
-) -> List[Dict[str, Any]]:
-    selected = set(job_ids)
-    result = []
-    for job in plan.get("jobs") or []:
-        if job.get("job_id") not in selected:
-            continue
-        payload = dict(job.get("request") or {})
-        payload["image"] = list(reference_urls)
-        result.append({"job_id": str(job["job_id"]), "request": payload})
-    if len(result) != len(selected):
-        raise StudioError("Manifest and plan job IDs do not match")
-    return result
-
-
-def request_set_fingerprint(entries: Sequence[Dict[str, Any]]) -> str:
-    payload = json.dumps(list(entries), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def quoted_reference_urls(manifest: Dict[str, Any], plan: Dict[str, Any]) -> List[str]:
-    direct = [validate_reference_url(str(value)) for value in (plan.get("reference_images") or [])]
-    uploaded = []
-    rows = manifest.get("reference_uploads") or []
-    if len(rows) != len(plan.get("reference_files") or []):
-        raise StudioError("Manifest reference uploads do not match the generation plan; run quote again")
-    for row in rows:
-        if row.get("status") != "uploaded" or upload_url_expired(row):
-            raise StudioError("A quoted reference upload is missing or expired; run quote again and reconfirm")
-        url = extract_upload_url({"url": row.get("url")})
-        if not url:
-            raise StudioError("Manifest contains an invalid uploaded reference URL; run quote again")
-        uploaded.append(url)
-    combined = direct + uploaded
-    if not combined:
-        raise StudioError("At least one product reference image is required")
-    if len(combined) > MAX_REFERENCE_IMAGES:
-        raise StudioError("Qx-Image accepts at most %d reference images" % MAX_REFERENCE_IMAGES)
-    return combined
-
-
-def command_quote(args: argparse.Namespace) -> None:
-    plan_path = Path(args.plan).resolve()
-    plan = load_json(plan_path)
-    jobs = plan.get("jobs")
-    if not isinstance(jobs, list) or not jobs:
-        raise StudioError("Generation plan contains no jobs")
-    if (plan.get("reference_coverage") or {}).get("status") != "complete":
-        raise StudioError("Exact quote requires a complete role-labeled reference coverage check; recreate the plan")
-    base_url = str(plan.get("base_url") or DEFAULT_BASE_URL)
-    if not qixuai_auth.is_qixuai_url(base_url):
-        raise StudioError("Exact image quotes are currently available only for token.qixuai.com")
-    output_dir = Path(args.output_dir).resolve()
-    manifest_path = output_dir / "generation_manifest.json"
-    preview = {
-        "mode": "dry-run" if not args.execute else "execute",
-        "endpoint": QUOTE_ENDPOINT,
-        "images": len(jobs),
-        "local_reference_uploads": len(plan.get("reference_files") or []),
-        "remote_reference_urls": len(plan.get("reference_images") or []),
-        "uploads_product_references": bool(plan.get("reference_files")),
-        "sends_prompts_for_quote": True,
-        "charges_credits": False,
-        "manifest": str(manifest_path),
-    }
-    if not args.execute:
-        print(json.dumps(preview, ensure_ascii=False, indent=2))
-        return
-    if not args.confirm_remote_quote:
-        raise StudioError(
-            "Remote quote requires --confirm-remote-quote after the user approves uploading references and sending prompts"
-        )
-    scopes = ["billing:read"]
-    if plan.get("reference_files"):
-        scopes.append("files:write")
-    api_key = require_api_key(args.api_key_env, base_url, scopes)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = load_or_create_manifest(manifest_path, plan, plan_path)
-    pending_ids = [
-        str(row["job_id"])
-        for row in manifest.get("jobs") or []
-        if not row.get("task_id") and row.get("status") in {"not_submitted", "submit_unknown"}
-    ]
-    if not pending_ids:
-        print(json.dumps({"status": "ok", "manifest": str(manifest_path), "message": "没有待报价任务"}, ensure_ascii=False))
-        return
-    reference_urls = upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
-    entries = job_requests(plan, pending_ids, reference_urls)
-    quote_payload = {
-        "model": str(plan.get("model") or DEFAULT_MODEL),
-        "jobs": [entry["request"] for entry in entries],
-    }
-    response = request_json("POST", QUOTE_ENDPOINT, api_key, quote_payload, args.timeout)
-    fields = billing_fields(response)
-    quote_id = str(fields.get("quote_id") or "").strip()
-    pricing_version = str(fields.get("pricing_version") or "").strip()
-    expires_at = str(fields.get("expires_at") or "").strip()
-    total = decimal_credits(fields.get("total_credits"), "total_credits")
-    balance = decimal_credits(fields.get("balance"), "balance")
-    sufficient = fields.get("sufficient")
-    if not quote_id or not pricing_version or not expires_at or not isinstance(sufficient, bool):
-        raise StudioError("Quote response is missing quote_id, pricing_version, expires_at, or sufficient")
-    if parse_utc_timestamp(expires_at, "Quote expires_at") <= datetime.now(timezone.utc):
-        raise StudioError("Quote response was already expired")
-    shortfall = max(Decimal("0"), total - balance)
-    manifest["reference_images"] = reference_urls
-    manifest["billing"] = {
-        "status": "quoted" if sufficient else "waiting_for_recharge",
-        "balance": format_credits(balance),
-        "required": format_credits(total),
-        "shortfall": format_credits(shortfall),
-        "unit": str(fields.get("unit") or "credits"),
-        "recharge_url": trusted_recharge_url(fields.get("recharge_url") or response.get("recharge_url")),
-        "checked_at": now_iso(),
-        "quote_id": quote_id,
-        "pricing_version": pricing_version,
-        "expires_at": expires_at,
-        "sufficient": sufficient,
-        "quoted_job_ids": pending_ids,
-        "request_sha256": request_set_fingerprint(entries),
-    }
-    write_json_atomic(manifest_path, manifest)
-    result = {
-        "status": "quoted" if sufficient else "waiting_for_recharge",
-        "manifest": str(manifest_path),
-        "images": len(pending_ids),
-        "exact_credits": format_credits(total),
-        "balance": format_credits(balance),
-        "sufficient": sufficient,
-        "expires_at": expires_at,
-        "pricing_version": pricing_version,
-        "recharge_url": manifest["billing"]["recharge_url"],
-    }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    if not sufficient:
-        raise InsufficientCreditsError(balance, total, manifest["billing"]["recharge_url"])
-
-
 def command_generate(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan).resolve()
     plan = load_json(plan_path)
@@ -1307,11 +1137,7 @@ def command_generate(args: argparse.Namespace) -> None:
         raise StudioError("Generation plan contains no jobs")
     output_dir = Path(args.output_dir).resolve()
     manifest_path = output_dir / "generation_manifest.json"
-    existing_billing: Dict[str, Any] = {}
-    if manifest_path.exists():
-        existing_manifest = load_json(manifest_path)
-        if existing_manifest.get("plan_sha256") == plan_fingerprint(plan):
-            existing_billing = existing_manifest.get("billing") or {}
+    estimate = int(plan.get("estimated_points") or len(jobs) * int(plan.get("points_per_image_estimate") or 10))
     preview = {
         "mode": "dry-run" if not args.execute else "execute",
         "endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true"),
@@ -1319,9 +1145,10 @@ def command_generate(args: argparse.Namespace) -> None:
         "images": len(jobs),
         "reference_roles": (plan.get("reference_coverage") or {}).get("supplied_roles", []),
         "fidelity_gate": (plan.get("reference_coverage") or {}).get("status", "unknown"),
-        "quote_status": existing_billing.get("status") or "quote_required",
-        "exact_credits": existing_billing.get("required"),
-        "quote_expires_at": existing_billing.get("expires_at"),
+        "local_reference_uploads": len(plan.get("reference_files") or []),
+        "remote_reference_urls": len(plan.get("reference_images") or []),
+        "estimated_points": estimate,
+        "recharge_url": RECHARGE_URL,
         "charges_credits": bool(args.execute),
         "manifest": str(manifest_path),
     }
@@ -1331,11 +1158,13 @@ def command_generate(args: argparse.Namespace) -> None:
     if preview["fidelity_gate"] != "complete":
         raise StudioError("Live generation requires a complete role-labeled reference coverage check; recreate the plan")
     if not args.confirm_live_run:
-        raise StudioError("Live generation requires --confirm-live-run after reviewing the exact quote")
-    if not manifest_path.exists():
-        raise StudioError("No exact quote exists. Run quote --execute --confirm-remote-quote first")
+        raise StudioError("Live generation requires --confirm-live-run after the user confirms the image plan")
     base_url = str(plan.get("base_url") or DEFAULT_BASE_URL)
-    api_key = require_api_key(args.api_key_env, base_url, ["images:write"])
+    required_scopes = ["images:write"]
+    if plan.get("reference_files"):
+        required_scopes.append("files:write")
+    api_key = require_api_key(args.api_key_env, base_url, required_scopes)
+    output_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_or_create_manifest(manifest_path, plan, plan_path)
     manifest_rows = {row["job_id"]: row for row in manifest["jobs"]}
     endpoint = api_endpoint(base_url, "images/generations?async=true")
@@ -1346,26 +1175,7 @@ def command_generate(args: argparse.Namespace) -> None:
     if not pending_rows:
         print(json.dumps({"status": "ok", "manifest": str(manifest_path), "submitted": 0, "jobs": len(jobs)}, ensure_ascii=False))
         return
-    billing = manifest.get("billing") or {}
-    if billing.get("status") == "waiting_for_recharge" or billing.get("sufficient") is False:
-        raise InsufficientCreditsError(
-            billing.get("balance"), billing.get("required"), billing.get("recharge_url") or RECHARGE_URL
-        )
-    if billing.get("status") != "quoted" or not billing.get("quote_id"):
-        raise StudioError("No usable exact quote exists. Run quote --execute --confirm-remote-quote first")
-    if parse_utc_timestamp(billing.get("expires_at"), "Quote expires_at") <= datetime.now(timezone.utc):
-        raise StudioError("The exact quote expired. Run quote again, review the new price, then reconfirm generation")
-    quoted_total = decimal_credits(billing.get("required"), "quoted total")
-    if args.max_points is None or decimal_credits(args.max_points, "max_points") < quoted_total:
-        raise StudioError("Set --max-points to at least the exact quote (%s)" % format_credits(quoted_total))
-    reference_urls = quoted_reference_urls(manifest, plan)
-    quoted_ids = [str(value) for value in (billing.get("quoted_job_ids") or [])]
-    pending_ids = [str(row["job_id"]) for row in pending_rows]
-    if not set(pending_ids).issubset(set(quoted_ids)):
-        raise StudioError("The exact quote does not cover every pending job; run quote again")
-    quoted_entries = job_requests(plan, quoted_ids, reference_urls)
-    if billing.get("request_sha256") != request_set_fingerprint(quoted_entries):
-        raise StudioError("The quoted requests or reference URLs changed; run quote again and reconfirm")
+    reference_urls = upload_local_references(manifest, manifest_path, plan, api_key, args.timeout)
     submitted = 0
     for job in jobs:
         row = manifest_rows.get(job["job_id"])
@@ -1375,7 +1185,6 @@ def command_generate(args: argparse.Namespace) -> None:
             continue
         payload = dict(job["request"])
         payload["image"] = reference_urls
-        payload["quote_id"] = str(billing["quote_id"])
         idempotency_key = str(row.get("idempotency_key") or "").strip()
         if not idempotency_key:
             idempotency_key = secrets.token_urlsafe(24)
@@ -1632,7 +1441,7 @@ def command_doctor(args: argparse.Namespace) -> None:
             qixuai_auth.resolve_api_key(
                 DEFAULT_BASE_URL,
                 args.api_key_env,
-                ("images:write", "files:write", "billing:read"),
+                ("images:write", "files:write"),
             )
         ) if key_name_ok else False
     except qixuai_auth.AuthError as exc:
@@ -1648,9 +1457,7 @@ def command_doctor(args: argparse.Namespace) -> None:
             else "qixuai_device" if credential_ready else None
         ),
         "credential_error": credential_error,
-        "required_device_scopes": ["images:write", "files:write", "billing:read"],
-        "balance_endpoint": BALANCE_ENDPOINT,
-        "quote_endpoint": QUOTE_ENDPOINT,
+        "required_device_scopes": ["images:write", "files:write"],
         "recharge_url": RECHARGE_URL,
         "ready_for_plan": True,
         "ready_for_generate": credential_ready,
@@ -1703,19 +1510,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--output", required=True)
     plan.set_defaults(func=command_plan)
 
-    quote = subparsers.add_parser("quote", help="Upload approved references and request an exact no-charge quote")
-    quote.add_argument("--plan", required=True)
-    quote.add_argument("--output-dir", required=True)
-    quote.add_argument("--execute", action="store_true")
-    quote.add_argument("--confirm-remote-quote", action="store_true")
-    quote.add_argument("--api-key-env", default="QIXUAI_API_KEY")
-    quote.add_argument("--timeout", type=int, default=30)
-    quote.set_defaults(func=command_quote)
-
     generate = subparsers.add_parser("generate", help="Preview or submit asynchronous Qx-Image jobs")
     generate.add_argument("--plan", required=True)
     generate.add_argument("--output-dir", required=True)
-    generate.add_argument("--max-points", type=int)
     generate.add_argument("--execute", action="store_true")
     generate.add_argument("--wait", action="store_true")
     generate.add_argument("--poll-interval", type=int, default=5)
