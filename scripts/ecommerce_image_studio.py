@@ -25,7 +25,7 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8")
 
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 DEFAULT_BASE_URL = "https://token.qixuai.com/v1"
 DEFAULT_MODEL = "Qx-Image"
 RECHARGE_URL = "https://token.qixuai.com/console/recharge?intent=buy"
@@ -50,7 +50,7 @@ TYPE_INSTRUCTIONS = {
     "white_bg": (
         "Create a clean marketplace catalog image on a true pure white #FFFFFF background. "
         "Show the complete product centered with generous margins, a natural contact shadow, "
-        "front three-quarter view, even studio lighting, and no props."
+        "using the best-supported view from the supplied references, even studio lighting, and no props."
     ),
     "hero": (
         "Create a premium e-commerce hero image with a restrained brand-appropriate set, clear visual hierarchy, "
@@ -422,6 +422,7 @@ def build_prompt(
         ordered_roles = ", ".join("image %d=%s" % (index, role) for index, role in enumerate(reference_roles, 1))
         prompt.append(
             "Reference order and evidence roles: %s. Use each reference only as evidence for its labeled view. "
+            "Compose the product only from these evidenced views and keep unseen faces out of frame. "
             "Never invent an unseen product face, construction, closure, print, seam, label, logo, or accessory." % ordered_roles
         )
     if text_mode == "render" and visible_copy:
@@ -544,10 +545,6 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     )
     supplied_roles = {view["role"] for view in reference_views}
     missing_roles = [role for role in required_roles if role not in supplied_roles]
-    if missing_roles:
-        raise StudioError(
-            "Reference coverage is insufficient for the requested images; ask the user for: %s" % ", ".join(missing_roles)
-        )
     if not 1 <= args.points_per_image <= 10000:
         raise StudioError("Points per image estimate must be between 1 and 10000")
     raw_size = args.size or brief.get("size")
@@ -576,6 +573,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
     if quality not in {"low", "medium", "high"}:
         raise StudioError("Quality must be low, medium, or high")
     jobs = []
+    deferred_shots = []
     used_job_ids = set()
     for position, shot in enumerate(shot_specs, 1):
         image_type = str(shot["type"]).strip()
@@ -607,6 +605,22 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         shot_scene = bounded_text(str(shot.get("scene") or scene), "Shot scene", 300)
         shot_direction = bounded_text(str(shot.get("direction") or ""), "Shot direction", 500)
         requested_roles = [normalize_reference_role(str(value)) for value in shot.get("reference_roles", [])]
+        shot_missing_roles = [role for role in requested_roles if role not in supplied_roles]
+        if shot_missing_roles:
+            deferred_shots.append(
+                {
+                    "job_id": shot_id,
+                    "index": position,
+                    "type": image_type,
+                    "label": TYPE_LABELS[image_type],
+                    "copy": visible_copy,
+                    "direction": shot_direction,
+                    "requested_roles": requested_roles,
+                    "missing_roles": shot_missing_roles,
+                    "reason": "该镜头明确需要尚未提供的商品视角，补图后可生成",
+                }
+            )
+            continue
         jobs.append(
             {
                 "job_id": shot_id,
@@ -619,6 +633,12 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
                     "scene": shot_scene,
                     "audience": shot_audience,
                     "reference_roles": requested_roles,
+                },
+                "fidelity": {
+                    "mode": "covered" if not missing_roles else "reference_bounded",
+                    "evidence_roles": [role for role in REFERENCE_ROLE_ORDER if role in supplied_roles],
+                    "requested_roles": requested_roles,
+                    "missing_roles": [],
                 },
                 "request": {
                     "model": DEFAULT_MODEL,
@@ -643,7 +663,7 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
             }
         )
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "generator_version": VERSION,
         "created_at": now_iso(),
         "provider": "算点边界",
@@ -660,13 +680,18 @@ def create_plan(args: argparse.Namespace) -> Dict[str, Any]:
         "reference_views": reference_views,
         "reference_coverage": {
             "supplied_roles": [role for role in REFERENCE_ROLE_ORDER if role in supplied_roles],
-            "required_roles": required_roles,
-            "missing_roles": [],
-            "status": "complete",
+            "recommended_roles": required_roles,
+            "missing_recommended_roles": missing_roles,
+            "status": "complete" if not missing_roles else "limited",
+            "generation_policy": "Only executable jobs constrained to supplied evidence may be generated",
         },
         "points_per_image_estimate": args.points_per_image,
         "estimated_points": args.points_per_image * len(jobs),
         "jobs": jobs,
+        "deferred_shots": deferred_shots,
+        "reference_suggestions": [
+            "补充 %s 视角可提高一致性并解锁更多构图" % role for role in missing_roles
+        ],
         "manual_review_required": True,
     }
 
@@ -681,10 +706,12 @@ def command_plan(args: argparse.Namespace) -> None:
                 "status": "ok",
                 "output": str(output),
                 "images": len(plan["jobs"]),
+                "deferred_images": len(plan.get("deferred_shots") or []),
                 "estimated_points": plan["estimated_points"],
                 "reference_images": len(plan["reference_images"]) + len(plan.get("reference_files") or []),
                 "reference_roles": plan["reference_coverage"]["supplied_roles"],
-                "fidelity_gate": plan["reference_coverage"]["status"],
+                "reference_coverage": plan["reference_coverage"]["status"],
+                "suggested_roles": plan["reference_coverage"]["missing_recommended_roles"],
             },
             ensure_ascii=False,
         )
@@ -1143,6 +1170,7 @@ def command_generate(args: argparse.Namespace) -> None:
         "endpoint": api_endpoint(str(plan.get("base_url") or DEFAULT_BASE_URL), "images/generations?async=true"),
         "model": plan.get("model"),
         "images": len(jobs),
+        "deferred_images": len(plan.get("deferred_shots") or []),
         "reference_roles": (plan.get("reference_coverage") or {}).get("supplied_roles", []),
         "fidelity_gate": (plan.get("reference_coverage") or {}).get("status", "unknown"),
         "local_reference_uploads": len(plan.get("reference_files") or []),
@@ -1155,8 +1183,8 @@ def command_generate(args: argparse.Namespace) -> None:
     if not args.execute:
         print(json.dumps(preview, ensure_ascii=False, indent=2))
         return
-    if preview["fidelity_gate"] != "complete":
-        raise StudioError("Live generation requires a complete role-labeled reference coverage check; recreate the plan")
+    if preview["fidelity_gate"] not in {"complete", "limited"}:
+        raise StudioError("Live generation requires a role-labeled, resource-aware plan; recreate the plan")
     if not args.confirm_live_run:
         raise StudioError("Live generation requires --confirm-live-run after the user confirms the image plan")
     base_url = str(plan.get("base_url") or DEFAULT_BASE_URL)

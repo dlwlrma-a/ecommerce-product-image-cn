@@ -165,32 +165,48 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(studio.StudioError):
             studio.validate_reference_url("http://example.com/product.jpg")
 
-    def test_apparel_front_generation_requires_front_and_back_evidence(self):
-        with self.assertRaises(studio.StudioError) as caught:
-            studio.create_plan(
-                plan_args(
-                    category="服装",
-                    types="hero",
-                    reference_url=["back=https://example.com/dress-back.jpg"],
-                )
-            )
-        self.assertIn("front", str(caught.exception))
+    def test_apparel_with_only_back_reference_creates_bounded_plan_and_suggestions(self):
         plan = studio.create_plan(
             plan_args(
                 category="服装",
                 types="hero",
-                reference_url=[
-                    "front=https://example.com/dress-front.jpg",
-                    "back=https://example.com/dress-back.jpg",
-                ],
+                reference_url=["back=https://example.com/dress-back.jpg"],
             )
         )
-        self.assertEqual(["front", "back"], plan["reference_coverage"]["required_roles"])
+        self.assertEqual("limited", plan["reference_coverage"]["status"])
+        self.assertEqual(["front", "back"], plan["reference_coverage"]["recommended_roles"])
+        self.assertEqual(["front"], plan["reference_coverage"]["missing_recommended_roles"])
+        self.assertEqual(1, len(plan["jobs"]))
+        self.assertIn("image 1=back", plan["jobs"][0]["request"]["prompt"])
+        self.assertIn("keep unseen faces out of frame", plan["jobs"][0]["request"]["prompt"])
 
-    def test_detail_generation_requires_detail_reference(self):
-        with self.assertRaises(studio.StudioError) as caught:
-            studio.create_plan(plan_args(types="detail"))
-        self.assertIn("detail", str(caught.exception))
+    def test_detail_without_detail_reference_is_a_suggestion_not_a_blocker(self):
+        plan = studio.create_plan(plan_args(types="detail"))
+        self.assertEqual("limited", plan["reference_coverage"]["status"])
+        self.assertEqual(["detail"], plan["reference_coverage"]["missing_recommended_roles"])
+        self.assertEqual(1, len(plan["jobs"]))
+
+    def test_shot_with_explicit_missing_view_is_deferred_without_blocking_safe_shots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            brief_path = Path(directory) / "brief.json"
+            studio.write_json_atomic(
+                brief_path,
+                {
+                    "shots": [
+                        {"id": "safe-back", "type": "hero", "reference_roles": ["back"]},
+                        {"id": "needs-front", "type": "hero", "reference_roles": ["front"]},
+                    ]
+                },
+            )
+            plan = studio.create_plan(
+                plan_args(
+                    brief=str(brief_path), types=None, category="服装",
+                    reference_url=["back=https://example.com/dress-back.jpg"],
+                )
+            )
+        self.assertEqual(["safe-back"], [job["job_id"] for job in plan["jobs"]])
+        self.assertEqual(["needs-front"], [job["job_id"] for job in plan["deferred_shots"]])
+        self.assertEqual(["front"], plan["deferred_shots"][0]["missing_roles"])
 
     def test_every_reference_requires_an_explicit_role(self):
         with self.assertRaises(studio.StudioError):
@@ -541,6 +557,41 @@ class WorkflowTests(unittest.TestCase):
                     os.environ["QIXUAI_API_KEY"] = original_key
             self.assertEqual(3, len(calls))
             self.assertTrue(all("quote_id" not in payload for payload in calls))
+
+    def test_limited_reference_plan_can_generate_evidence_bounded_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = studio.create_plan(
+                plan_args(
+                    category="服装", types="hero",
+                    reference_url=["back=https://example.com/dress-back.jpg"],
+                )
+            )
+            plan_path = root / "plan.json"
+            studio.write_json_atomic(plan_path, plan)
+            calls = []
+            original_request = studio.request_json
+            original_key = os.environ.get("QIXUAI_API_KEY")
+            os.environ["QIXUAI_API_KEY"] = "test-key"
+            studio.request_json = lambda method, url, api_key, payload, timeout, extra_headers=None: (
+                calls.append(payload) or {"task_id": "task-limited"}
+            )
+            args = argparse.Namespace(
+                plan=str(plan_path), output_dir=str(root / "output"), max_points=None,
+                execute=True, wait=False, poll_interval=5, wait_timeout=900,
+                api_key_env="QIXUAI_API_KEY", confirm_live_run=True, timeout=30,
+            )
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    studio.command_generate(args)
+            finally:
+                studio.request_json = original_request
+                if original_key is None:
+                    os.environ.pop("QIXUAI_API_KEY", None)
+                else:
+                    os.environ["QIXUAI_API_KEY"] = original_key
+            self.assertEqual(1, len(calls))
+            self.assertIn("image 1=back", calls[0]["prompt"])
 
     def test_generation_402_pauses_and_points_to_recharge(self):
         with tempfile.TemporaryDirectory() as directory:

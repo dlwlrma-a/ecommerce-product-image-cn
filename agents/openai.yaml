@@ -1,7 +1,7 @@
 interface:
   display_name: "电商商品套图生成"
-  short_description: "根据商品原图和卖点生成主图、场景图、卖点图并完成质量检查"
+  short_description: "先用现有素材规划可生成套图，再建议补图提升一致性"
   icon_small: "./assets/icon.svg"
   icon_large: "./assets/icon.svg"
   brand_color: "#E5484D"
-  default_prompt: "使用 $ecommerce-product-image-cn 检查我的商品参考图，逐张确认构图和中文文案，确认方案后直接生成高一致性的电商套图。"
+  default_prompt: "使用 $ecommerce-product-image-cn 根据我现有的商品参考图先给出可生成方案，再建议补哪些视角能提升效果；确认后直接生成。"
